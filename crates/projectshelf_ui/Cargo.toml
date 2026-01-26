@@ -1,0 +1,13 @@
+[package]
+name = "projectshelf_ui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "projectshelf"
+path = "src/main.rs"
+
+[dependencies]
+projectshelf_core = { path = "../projectshelf_core" }
+eframe = "0.28"
+egui = "0.28"

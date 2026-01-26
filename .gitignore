@@ -1,0 +1,37 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Rustfmt backups
+**/*.rs.bk
+
+# IntelliJ / RustRover / CLion
+.idea/
+
+# VS Code
+.vscode/
+
+# JetBrains Fleet
+.fleet/
+
+# Vim / Neovim
+*~
+.*.swp
+.*.swo
+
+# macOS
+.DS_Store
+
+# Linux
+.directory
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# SQLite (only if you decide to store a local dev DB inside the repo)
+*.sqlite
+*.sqlite3

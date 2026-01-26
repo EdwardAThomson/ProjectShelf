@@ -1,14 +1,16 @@
 use eframe::egui;
-use projectshelf_core::{config, scan_projects, Database, Project};
+use projectshelf_core::{config, scan_projects, Database, LanguageBreakdown, Project};
+use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
 pub struct ProjectShelfApp {
     projects: Vec<Project>,
+    languages: HashMap<String, LanguageBreakdown>,
     selected_idx: Option<usize>,
     search_query: String,
     db: Option<Database>,
-    scan_rx: Option<Receiver<Vec<Project>>>,
+    scan_rx: Option<Receiver<Vec<(Project, LanguageBreakdown)>>>,
     scan_tx: Option<Sender<()>>,
     is_scanning: bool,
     sort_mode: SortMode,
@@ -41,6 +43,7 @@ impl ProjectShelfApp {
 
         let mut app = Self {
             projects,
+            languages: HashMap::new(),
             selected_idx: None,
             search_query: String::new(),
             db,
@@ -75,18 +78,29 @@ impl ProjectShelfApp {
 
     fn check_scan_results(&mut self) {
         if let Some(rx) = &self.scan_rx {
-            if let Ok(projects) = rx.try_recv() {
-                if let Some(db) = &self.db {
-                    for p in &projects {
-                        let _ = db.upsert_project(p);
+            if let Ok(scan_results) = rx.try_recv() {
+                let mut projects = Vec::new();
+                let mut languages = HashMap::new();
+
+                for (project, lang_breakdown) in scan_results {
+                    if let Some(db) = &self.db {
+                        let _ = db.upsert_project(&project);
+                        let _ = db.upsert_languages(&project.project_id, &lang_breakdown);
                     }
+                    languages.insert(project.project_id.clone(), lang_breakdown);
+                    projects.push(project);
+                }
+
+                if let Some(db) = &self.db {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
                     let _ = db.update_scan_state(now);
                 }
+
                 self.projects = projects;
+                self.languages = languages;
                 self.is_scanning = false;
                 self.scan_rx = None;
             }
@@ -291,10 +305,50 @@ impl ProjectShelfApp {
                 ui.end_row();
             });
 
-        if let Some(lang) = &project.primary_language {
-            ui.separator();
-            ui.heading("Language");
+        ui.separator();
+        ui.heading("Languages");
+
+        let project_id = &project.project_id;
+        if let Some(breakdown) = self.languages.get(project_id) {
+            let top_langs = breakdown.top_n(5);
+            if top_langs.is_empty() {
+                ui.label("No code files detected");
+            } else {
+                for (lang, bytes, pct) in top_langs {
+                    ui.horizontal(|ui| {
+                        let bar_width = 100.0;
+                        let filled_width = bar_width * (pct / 100.0);
+
+                        let (rect, _response) = ui.allocate_exact_size(
+                            egui::vec2(bar_width, 14.0),
+                            egui::Sense::hover(),
+                        );
+
+                        ui.painter().rect_filled(
+                            rect,
+                            2.0,
+                            egui::Color32::from_rgb(60, 60, 60),
+                        );
+
+                        let filled_rect = egui::Rect::from_min_size(
+                            rect.min,
+                            egui::vec2(filled_width, rect.height()),
+                        );
+                        ui.painter().rect_filled(
+                            filled_rect,
+                            2.0,
+                            language_color(lang),
+                        );
+
+                        ui.label(format!("{} ({:.1}%)", lang, pct));
+                        ui.label(egui::RichText::new(format_bytes(bytes)).color(egui::Color32::GRAY));
+                    });
+                }
+            }
+        } else if let Some(lang) = &project.primary_language {
             ui.label(lang);
+        } else {
+            ui.label("No language data");
         }
     }
 }
@@ -353,4 +407,49 @@ fn format_timestamp(ts: i64) -> String {
     }
 
     "unknown".to_string()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{} B", bytes);
+    }
+    let kb = bytes as f64 / 1024.0;
+    if kb < 1024.0 {
+        return format!("{:.1} KB", kb);
+    }
+    let mb = kb / 1024.0;
+    if mb < 1024.0 {
+        return format!("{:.1} MB", mb);
+    }
+    let gb = mb / 1024.0;
+    format!("{:.1} GB", gb)
+}
+
+fn language_color(lang: &str) -> egui::Color32 {
+    match lang {
+        "Rust" => egui::Color32::from_rgb(222, 165, 132),
+        "Python" => egui::Color32::from_rgb(53, 114, 165),
+        "JavaScript" => egui::Color32::from_rgb(241, 224, 90),
+        "TypeScript" => egui::Color32::from_rgb(49, 120, 198),
+        "Go" => egui::Color32::from_rgb(0, 173, 216),
+        "C" => egui::Color32::from_rgb(85, 85, 85),
+        "C++" => egui::Color32::from_rgb(243, 75, 125),
+        "Java" => egui::Color32::from_rgb(176, 114, 25),
+        "Ruby" => egui::Color32::from_rgb(204, 52, 45),
+        "PHP" => egui::Color32::from_rgb(79, 93, 149),
+        "C#" => egui::Color32::from_rgb(23, 134, 0),
+        "Swift" => egui::Color32::from_rgb(255, 172, 69),
+        "Kotlin" => egui::Color32::from_rgb(169, 123, 255),
+        "Shell" => egui::Color32::from_rgb(137, 224, 81),
+        "HTML" => egui::Color32::from_rgb(227, 76, 38),
+        "CSS" => egui::Color32::from_rgb(86, 61, 124),
+        "SCSS" => egui::Color32::from_rgb(198, 83, 140),
+        "Vue" => egui::Color32::from_rgb(65, 184, 131),
+        "Svelte" => egui::Color32::from_rgb(255, 62, 0),
+        "Markdown" => egui::Color32::from_rgb(8, 63, 161),
+        "JSON" => egui::Color32::from_rgb(41, 41, 41),
+        "YAML" => egui::Color32::from_rgb(203, 23, 30),
+        "TOML" => egui::Color32::from_rgb(156, 66, 33),
+        _ => egui::Color32::from_rgb(100, 100, 100),
+    }
 }

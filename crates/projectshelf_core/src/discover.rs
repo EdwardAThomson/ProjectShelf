@@ -1,6 +1,7 @@
 use crate::config::{IGNORED_DIRS, MAX_DEPTH};
 use crate::fs_activity::get_last_fs_activity;
 use crate::git::get_git_metadata;
+use crate::languages::{detect_languages, LanguageBreakdown};
 use crate::models::{IconKind, Project};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -54,7 +55,7 @@ fn discover_recursive(dir: &Path, depth: usize, projects: &mut Vec<DiscoveredPro
     }
 }
 
-pub fn build_project(discovered: &DiscoveredProject) -> Project {
+pub fn build_project(discovered: &DiscoveredProject) -> (Project, LanguageBreakdown) {
     let path_str = discovered.path.to_string_lossy().to_string();
     let project_id = generate_project_id(&path_str);
     let name = discovered
@@ -72,8 +73,10 @@ pub fn build_project(discovered: &DiscoveredProject) -> Project {
 
     let git_meta = get_git_metadata(&discovered.path);
     let last_fs_activity_ts = get_last_fs_activity(&discovered.path);
+    let lang_breakdown = detect_languages(&discovered.path);
+    let primary_language = lang_breakdown.primary_language().map(|s| s.to_string());
 
-    Project {
+    let project = Project {
         project_id,
         name,
         path: path_str,
@@ -83,8 +86,10 @@ pub fn build_project(discovered: &DiscoveredProject) -> Project {
         last_fs_activity_ts,
         dirty: git_meta.dirty,
         branch: git_meta.branch,
-        primary_language: None,
-    }
+        primary_language,
+    };
+
+    (project, lang_breakdown)
 }
 
 fn generate_project_id(canonical_path: &str) -> String {
@@ -117,7 +122,7 @@ fn detect_icon_kind(path: &Path, is_git: bool) -> IconKind {
     }
 }
 
-pub fn scan_projects(root: &Path) -> Vec<Project> {
+pub fn scan_projects(root: &Path) -> Vec<(Project, LanguageBreakdown)> {
     discover_projects(root)
         .iter()
         .map(build_project)

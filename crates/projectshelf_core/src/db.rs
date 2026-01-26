@@ -1,4 +1,5 @@
 use crate::config::{data_dir, db_path};
+use crate::languages::LanguageBreakdown;
 use crate::models::{IconKind, Project};
 use rusqlite::{params, Connection, Result};
 use std::fs;
@@ -166,5 +167,34 @@ impl Database {
             .prepare("SELECT last_scan_ts, version FROM scan_state WHERE id = 1")?;
         let result = stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(result)
+    }
+
+    pub fn upsert_languages(&self, project_id: &str, breakdown: &LanguageBreakdown) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM languages WHERE project_id = ?1",
+            params![project_id],
+        )?;
+
+        for (lang, bytes) in &breakdown.languages {
+            self.conn.execute(
+                "INSERT INTO languages (project_id, language, bytes) VALUES (?1, ?2, ?3)",
+                params![project_id, lang, *bytes as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn get_languages(&self, project_id: &str) -> Result<Vec<(String, u64)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT language, bytes FROM languages WHERE project_id = ?1 ORDER BY bytes DESC",
+        )?;
+
+        let langs = stmt
+            .query_map(params![project_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(langs)
     }
 }

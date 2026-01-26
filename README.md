@@ -123,7 +123,3 @@ ProjectShelf/
 ## License
 
 MIT
-
-## Contributing
-
-Contributions welcome! Please open an issue first to discuss what you'd like to change.

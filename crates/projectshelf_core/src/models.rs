@@ -12,6 +12,7 @@ pub struct Project {
     pub dirty: bool,
     pub branch: Option<String>,
     pub primary_language: Option<String>,
+    pub github_url: Option<String>,
 }
 
 impl Project {
@@ -64,7 +65,7 @@ impl IconKind {
 
     pub fn emoji(&self) -> &'static str {
         match self {
-            IconKind::Rust => "🦀",
+            IconKind::Rust => "🔧",
             IconKind::Python => "🐍",
             IconKind::Node => "📦",
             IconKind::Go => "🐹",

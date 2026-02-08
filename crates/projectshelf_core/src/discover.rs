@@ -87,6 +87,7 @@ pub fn build_project(discovered: &DiscoveredProject) -> (Project, LanguageBreakd
         dirty: git_meta.dirty,
         branch: git_meta.branch,
         primary_language,
+        github_url: git_meta.github_url,
     };
 
     (project, lang_breakdown)

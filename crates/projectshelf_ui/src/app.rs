@@ -1,6 +1,10 @@
 use eframe::egui;
-use projectshelf_core::{config, scan_projects, Database, LanguageBreakdown, Project};
+use projectshelf_core::{
+    config, scan_projects, Database, LanguageBreakdown, Milestone, MilestoneStatus, Project,
+    ProjectFile, UserMeta,
+};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -14,6 +18,9 @@ pub struct ProjectShelfApp {
     scan_tx: Option<Sender<()>>,
     is_scanning: bool,
     sort_mode: SortMode,
+    milestones: HashMap<String, Vec<Milestone>>,
+    user_meta: HashMap<String, UserMeta>,
+    new_milestone_title: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -34,7 +41,8 @@ impl SortMode {
 }
 
 impl ProjectShelfApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_fonts(&cc.egui_ctx);
         let db = Database::open().ok();
         let projects = db
             .as_ref()
@@ -51,6 +59,9 @@ impl ProjectShelfApp {
             scan_tx: None,
             is_scanning: false,
             sort_mode: SortMode::RecentActivity,
+            milestones: HashMap::new(),
+            user_meta: HashMap::new(),
+            new_milestone_title: String::new(),
         };
 
         app.start_scan();
@@ -177,7 +188,7 @@ impl ProjectShelfApp {
                 self.projects.get(idx).map(|p| {
                     let dirty_badge = if p.dirty { " ●" } else { "" };
                     let branch_info = p.branch.as_deref().unwrap_or("");
-                    (idx, p.icon_kind.emoji().to_string(), p.name.clone(), dirty_badge.to_string(), branch_info.to_string())
+                    (idx, p.icon_kind.emoji().to_string(), p.name.clone(), dirty_badge.to_string(), branch_info.to_string(), p.icon_kind.as_str().to_string())
                 })
             })
             .collect();
@@ -187,15 +198,18 @@ impl ProjectShelfApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                for (idx, emoji, name, dirty, branch) in &display_items {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                for (idx, emoji, name, dirty, branch, icon_kind) in &display_items {
                     let is_selected = new_selection == Some(*idx);
                     ui.horizontal(|ui| {
-                        let base_label = if branch.is_empty() {
-                            format!("{} {}", emoji, name)
+                        let icon_color = icon_kind_color(icon_kind);
+                        ui.label(egui::RichText::new(emoji).color(icon_color).size(16.0));
+                        let label_text = if branch.is_empty() {
+                            name.clone()
                         } else {
-                            format!("{} {} [{}]", emoji, name, branch)
+                            format!("{} [{}]", name, branch)
                         };
-                        let response = ui.selectable_label(is_selected, &base_label);
+                        let response = ui.selectable_label(is_selected, &label_text);
                         if !dirty.is_empty() {
                             ui.label(egui::RichText::new(dirty).color(egui::Color32::from_rgb(255, 150, 50)));
                         }
@@ -231,12 +245,12 @@ impl ProjectShelfApp {
         ui.separator();
 
         ui.horizontal(|ui| {
-            if ui.button("📂 Open Folder").clicked() {
+            if colored_button(ui, "📂 Open Folder", egui::Color32::from_rgb(100, 149, 237)).clicked() {
                 let _ = std::process::Command::new("xdg-open")
                     .arg(&project.path)
                     .spawn();
             }
-            if ui.button("💻 Terminal").clicked() {
+            if colored_button(ui, "💻 Terminal", egui::Color32::from_rgb(80, 80, 80)).clicked() {
                 let _ = std::process::Command::new("x-terminal-emulator")
                     .current_dir(&project.path)
                     .spawn()
@@ -253,7 +267,7 @@ impl ProjectShelfApp {
                             .spawn()
                     });
             }
-            if ui.button("📝 Open in IDE").clicked() {
+            if colored_button(ui, "📝 Open in IDE", egui::Color32::from_rgb(86, 156, 214)).clicked() {
                 let path = &project.path;
                 let _ = std::process::Command::new("windsurf")
                     .arg(path)
@@ -264,6 +278,13 @@ impl ProjectShelfApp {
                     .or_else(|_| std::process::Command::new("subl").arg(path).spawn())
                     .or_else(|_| std::process::Command::new("atom").arg(path).spawn())
                     .or_else(|_| std::process::Command::new("gedit").arg(path).spawn());
+            }
+            if let Some(github_url) = &project.github_url {
+                if colored_button(ui, "🔗 GitHub", egui::Color32::from_rgb(110, 84, 148)).clicked() {
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(github_url)
+                        .spawn();
+                }
             }
         });
 
@@ -350,6 +371,175 @@ impl ProjectShelfApp {
         } else {
             ui.label("No language data");
         }
+
+        let project_id = project.project_id.clone();
+        let project_path = project.path.clone();
+
+        ui.separator();
+        self.render_milestones(ui, &project_id);
+
+        ui.separator();
+        self.render_notes(ui, &project_id, &project_path);
+    }
+
+    fn render_milestones(&mut self, ui: &mut egui::Ui, project_id: &str) {
+        ui.horizontal(|ui| {
+            ui.heading("Milestones");
+            if ui.small_button("+ Add").clicked() && !self.new_milestone_title.trim().is_empty() {
+                let milestone = Milestone {
+                    project_id: project_id.to_string(),
+                    id: uuid_simple(),
+                    title: self.new_milestone_title.trim().to_string(),
+                    status: MilestoneStatus::Todo,
+                    due_ts: None,
+                    link: None,
+                };
+                if let Some(db) = &self.db {
+                    let _ = db.upsert_milestone(&milestone);
+                }
+                self.milestones
+                    .entry(project_id.to_string())
+                    .or_default()
+                    .push(milestone);
+                self.new_milestone_title.clear();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("New:");
+            ui.text_edit_singleline(&mut self.new_milestone_title);
+        });
+
+        if !self.milestones.contains_key(project_id) {
+            if let Some(db) = &self.db {
+                if let Ok(ms) = db.get_milestones(project_id) {
+                    self.milestones.insert(project_id.to_string(), ms);
+                }
+            }
+        }
+
+        let milestones = self.milestones.get(project_id).cloned().unwrap_or_default();
+        if milestones.is_empty() {
+            ui.label(egui::RichText::new("No milestones yet").color(egui::Color32::GRAY));
+        } else {
+            let mut to_delete: Option<String> = None;
+            let mut updates: Vec<Milestone> = Vec::new();
+
+            for m in &milestones {
+                ui.horizontal(|ui| {
+                    let status_emoji = match m.status {
+                        MilestoneStatus::Todo => "⬚",
+                        MilestoneStatus::InProgress => "▶",
+                        MilestoneStatus::Blocked => "⊘",
+                        MilestoneStatus::Done => "✓",
+                    };
+
+                    let mut current_status = m.status.clone();
+                    egui::ComboBox::from_id_source(&m.id)
+                        .selected_text(status_emoji)
+                        .width(40.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut current_status, MilestoneStatus::Todo, "⬚ Todo");
+                            ui.selectable_value(&mut current_status, MilestoneStatus::InProgress, "▶ In Progress");
+                            ui.selectable_value(&mut current_status, MilestoneStatus::Blocked, "⊘ Blocked");
+                            ui.selectable_value(&mut current_status, MilestoneStatus::Done, "✓ Done");
+                        });
+
+                    if current_status != m.status {
+                        let mut updated = m.clone();
+                        updated.status = current_status;
+                        updates.push(updated);
+                    }
+
+                    let text_color = match m.status {
+                        MilestoneStatus::Done => egui::Color32::from_rgb(100, 200, 100),
+                        MilestoneStatus::Blocked => egui::Color32::from_rgb(255, 100, 100),
+                        MilestoneStatus::InProgress => egui::Color32::from_rgb(100, 150, 255),
+                        MilestoneStatus::Todo => egui::Color32::GRAY,
+                    };
+                    ui.label(egui::RichText::new(&m.title).color(text_color));
+
+                    if ui.small_button("🗑").clicked() {
+                        to_delete = Some(m.id.clone());
+                    }
+                });
+            }
+
+            for updated in updates {
+                if let Some(db) = &self.db {
+                    let _ = db.upsert_milestone(&updated);
+                }
+                if let Some(list) = self.milestones.get_mut(project_id) {
+                    if let Some(m) = list.iter_mut().find(|x| x.id == updated.id) {
+                        m.status = updated.status;
+                    }
+                }
+            }
+
+            if let Some(id) = to_delete {
+                if let Some(db) = &self.db {
+                    let _ = db.delete_milestone(project_id, &id);
+                }
+                if let Some(list) = self.milestones.get_mut(project_id) {
+                    list.retain(|x| x.id != id);
+                }
+            }
+        }
+    }
+
+    fn render_notes(&mut self, ui: &mut egui::Ui, project_id: &str, project_path: &str) {
+        ui.horizontal(|ui| {
+            ui.heading("Notes");
+            if ui.small_button("💾 Save to file").clicked() {
+                self.save_project_file(project_id, project_path);
+            }
+        });
+
+        if !self.user_meta.contains_key(project_id) {
+            if let Some(db) = &self.db {
+                if let Ok(meta) = db.get_user_meta(project_id) {
+                    self.user_meta.insert(project_id.to_string(), meta);
+                }
+            }
+        }
+
+        let meta = self
+            .user_meta
+            .entry(project_id.to_string())
+            .or_insert_with(|| UserMeta {
+                project_id: project_id.to_string(),
+                pinned: false,
+                notes: String::new(),
+            });
+
+        let response = ui.add(
+            egui::TextEdit::multiline(&mut meta.notes)
+                .desired_width(f32::INFINITY)
+                .desired_rows(4)
+                .hint_text("Add notes about this project..."),
+        );
+
+        if response.changed() {
+            if let Some(db) = &self.db {
+                let _ = db.upsert_user_meta(meta);
+            }
+        }
+    }
+
+    fn save_project_file(&self, project_id: &str, project_path: &str) {
+        let milestones = self.milestones.get(project_id).cloned().unwrap_or_default();
+        let user_meta = self
+            .user_meta
+            .get(project_id)
+            .cloned()
+            .unwrap_or_else(|| UserMeta {
+                project_id: project_id.to_string(),
+                pinned: false,
+                notes: String::new(),
+            });
+
+        let proj_file = ProjectFile::from_data(&milestones, &user_meta);
+        let _ = proj_file.save(Path::new(project_path));
     }
 }
 
@@ -451,5 +641,69 @@ fn language_color(lang: &str) -> egui::Color32 {
         "YAML" => egui::Color32::from_rgb(203, 23, 30),
         "TOML" => egui::Color32::from_rgb(156, 66, 33),
         _ => egui::Color32::from_rgb(100, 100, 100),
+    }
+}
+
+fn uuid_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:x}{:x}", now.as_secs(), now.subsec_nanos())
+}
+
+fn icon_kind_color(kind: &str) -> egui::Color32 {
+    match kind {
+        "rust" => egui::Color32::from_rgb(222, 165, 132),
+        "python" => egui::Color32::from_rgb(55, 118, 171),
+        "node" => egui::Color32::from_rgb(104, 159, 99),
+        "go" => egui::Color32::from_rgb(0, 173, 216),
+        "cpp" => egui::Color32::from_rgb(243, 75, 125),
+        "git" => egui::Color32::from_rgb(240, 80, 51),
+        "marked" => egui::Color32::from_rgb(255, 193, 7),
+        _ => egui::Color32::from_rgb(150, 150, 150),
+    }
+}
+
+fn colored_button(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::Response {
+    let button = egui::Button::new(
+        egui::RichText::new(text).color(egui::Color32::from_rgb(230, 230, 230))
+    ).fill(color);
+    ui.add(button)
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    let candidates = [
+        "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/opentype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+        "/usr/share/fonts/truetype/ancient-scripts/Symbola.ttf",
+        "/usr/share/fonts/truetype/ttf-ancient-fonts/Symbola.ttf",
+    ];
+
+    if let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) {
+        fonts.font_data.insert(
+            "emoji".to_string(),
+            egui::FontData::from_owned(bytes),
+        );
+
+        if let Some(family) = fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+        {
+            family.push("emoji".to_string());
+        }
+
+        if let Some(family) = fonts
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+        {
+            family.push("emoji".to_string());
+        }
+
+        ctx.set_fonts(fonts);
     }
 }

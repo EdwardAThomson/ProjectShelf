@@ -110,9 +110,9 @@ ProjectShelf/
 
 - [x] **M1** — Project discovery + cached list
 - [x] **M2** — Git metadata + activity sorting
-- [ ] **M3** — Language detection with byte counts
-- [ ] **M4** — Milestones + notes per project
-- [ ] **M5** — GitHub remote integration
+- [x] **M3** — Language detection with byte counts
+- [x] **M4** — Milestones + notes per project
+- [x] **M5** — GitHub remote integration
 
 ## Tech Stack
 

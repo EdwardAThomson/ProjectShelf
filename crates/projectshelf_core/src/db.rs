@@ -1,6 +1,6 @@
 use crate::config::{data_dir, db_path};
 use crate::languages::LanguageBreakdown;
-use crate::models::{IconKind, Project};
+use crate::models::{IconKind, Milestone, MilestoneStatus, Project, UserMeta};
 use rusqlite::{params, Connection, Result};
 use std::fs;
 use thiserror::Error;
@@ -41,7 +41,8 @@ impl Database {
                 last_fs_activity_ts INTEGER,
                 dirty INTEGER NOT NULL DEFAULT 0,
                 branch TEXT,
-                primary_language TEXT
+                primary_language TEXT,
+                github_url TEXT
             );
 
             CREATE TABLE IF NOT EXISTS languages (
@@ -86,6 +87,13 @@ impl Database {
             INSERT OR IGNORE INTO scan_state (id, last_scan_ts, version) VALUES (1, 0, 1);
             "#,
         )?;
+
+        // Migration: add github_url column if missing
+        let _ = self.conn.execute(
+            "ALTER TABLE projects ADD COLUMN github_url TEXT",
+            [],
+        );
+
         Ok(())
     }
 
@@ -94,8 +102,8 @@ impl Database {
             r#"
             INSERT INTO projects (
                 project_id, name, path, icon_kind, last_seen,
-                last_commit_ts, last_fs_activity_ts, dirty, branch, primary_language
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                last_commit_ts, last_fs_activity_ts, dirty, branch, primary_language, github_url
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(project_id) DO UPDATE SET
                 name = excluded.name,
                 path = excluded.path,
@@ -105,7 +113,8 @@ impl Database {
                 last_fs_activity_ts = excluded.last_fs_activity_ts,
                 dirty = excluded.dirty,
                 branch = excluded.branch,
-                primary_language = excluded.primary_language
+                primary_language = excluded.primary_language,
+                github_url = excluded.github_url
             "#,
             params![
                 project.project_id,
@@ -118,6 +127,7 @@ impl Database {
                 project.dirty as i32,
                 project.branch,
                 project.primary_language,
+                project.github_url,
             ],
         )?;
         Ok(())
@@ -127,7 +137,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT project_id, name, path, icon_kind, last_seen,
-                   last_commit_ts, last_fs_activity_ts, dirty, branch, primary_language
+                   last_commit_ts, last_fs_activity_ts, dirty, branch, primary_language, github_url
             FROM projects
             ORDER BY last_seen DESC
             "#,
@@ -146,6 +156,7 @@ impl Database {
                     dirty: row.get::<_, i32>(7)? != 0,
                     branch: row.get(8)?,
                     primary_language: row.get(9)?,
+                    github_url: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -196,5 +207,95 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(langs)
+    }
+
+    pub fn upsert_user_meta(&self, meta: &UserMeta) -> Result<(), DbError> {
+        self.conn.execute(
+            r#"
+            INSERT INTO user_meta (project_id, pinned, notes)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(project_id) DO UPDATE SET
+                pinned = excluded.pinned,
+                notes = excluded.notes
+            "#,
+            params![meta.project_id, meta.pinned as i32, meta.notes],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_user_meta(&self, project_id: &str) -> Result<UserMeta, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project_id, pinned, notes FROM user_meta WHERE project_id = ?1",
+        )?;
+
+        let result = stmt.query_row(params![project_id], |row| {
+            Ok(UserMeta {
+                project_id: row.get(0)?,
+                pinned: row.get::<_, i32>(1)? != 0,
+                notes: row.get(2)?,
+            })
+        });
+
+        match result {
+            Ok(meta) => Ok(meta),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(UserMeta {
+                project_id: project_id.to_string(),
+                pinned: false,
+                notes: String::new(),
+            }),
+            Err(e) => Err(DbError::Sqlite(e)),
+        }
+    }
+
+    pub fn upsert_milestone(&self, milestone: &Milestone) -> Result<(), DbError> {
+        self.conn.execute(
+            r#"
+            INSERT INTO milestones (project_id, id, title, status, due_ts, link)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(project_id, id) DO UPDATE SET
+                title = excluded.title,
+                status = excluded.status,
+                due_ts = excluded.due_ts,
+                link = excluded.link
+            "#,
+            params![
+                milestone.project_id,
+                milestone.id,
+                milestone.title,
+                milestone.status.as_str(),
+                milestone.due_ts,
+                milestone.link,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_milestone(&self, project_id: &str, milestone_id: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM milestones WHERE project_id = ?1 AND id = ?2",
+            params![project_id, milestone_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_milestones(&self, project_id: &str) -> Result<Vec<Milestone>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project_id, id, title, status, due_ts, link FROM milestones WHERE project_id = ?1",
+        )?;
+
+        let milestones = stmt
+            .query_map(params![project_id], |row| {
+                Ok(Milestone {
+                    project_id: row.get(0)?,
+                    id: row.get(1)?,
+                    title: row.get(2)?,
+                    status: MilestoneStatus::from_str(&row.get::<_, String>(3)?),
+                    due_ts: row.get(4)?,
+                    link: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(milestones)
     }
 }

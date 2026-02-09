@@ -14,6 +14,10 @@ A local-first desktop application that indexes projects inside `~/Projects` and 
 - **Quick Actions** — Open folder, terminal, or IDE with one click
 - **Search & Sort** — Fuzzy search and multiple sort modes
 - **Local Cache** — SQLite database for instant startup
+- **Tags** — Assign tags to projects and filter the list by tag
+- **Pinned Projects** — Pin favourites so they float to the top of the list
+- **YAML Import** — Milestones and notes are imported from `.projman/project.yaml` on scan
+- **Settings** — Configurable projects root directory and preferred IDE
 
 ## Screenshots
 
@@ -104,7 +108,7 @@ ProjectShelf/
 ## Data Storage
 
 - **Database**: `~/.local/share/projman/projman.sqlite`
-- **Config** (future): `~/.config/projman/config.toml`
+- **Settings**: `~/.local/share/projman/settings.toml`
 
 ## Roadmap
 
@@ -113,6 +117,7 @@ ProjectShelf/
 - [x] **M3** — Language detection with byte counts
 - [x] **M4** — Milestones + notes per project
 - [x] **M5** — GitHub remote integration
+- [x] **M6** — Tags, pinned projects, YAML import, settings
 
 ## Tech Stack
 

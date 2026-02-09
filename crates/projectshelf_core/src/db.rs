@@ -278,6 +278,42 @@ impl Database {
         Ok(())
     }
 
+    pub fn add_tag(&self, project_id: &str, tag: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO tags (project_id, tag) VALUES (?1, ?2)",
+            params![project_id, tag],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_tag(&self, project_id: &str, tag: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM tags WHERE project_id = ?1 AND tag = ?2",
+            params![project_id, tag],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_tags(&self, project_id: &str) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tag FROM tags WHERE project_id = ?1 ORDER BY tag",
+        )?;
+        let tags = stmt
+            .query_map(params![project_id], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(tags)
+    }
+
+    pub fn get_all_tags(&self) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT tag FROM tags ORDER BY tag",
+        )?;
+        let tags = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(tags)
+    }
+
     pub fn get_milestones(&self, project_id: &str) -> Result<Vec<Milestone>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT project_id, id, title, status, due_ts, link FROM milestones WHERE project_id = ?1",

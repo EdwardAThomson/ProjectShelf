@@ -4,6 +4,7 @@ use projectshelf_core::{
     ProjectFile, UserMeta,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -21,6 +22,13 @@ pub struct ProjectShelfApp {
     milestones: HashMap<String, Vec<Milestone>>,
     user_meta: HashMap<String, UserMeta>,
     new_milestone_title: String,
+    tags: HashMap<String, Vec<String>>,
+    all_tags: Vec<String>,
+    new_tag: String,
+    tag_filter: Option<String>,
+    show_settings: bool,
+    settings_projects_root: String,
+    settings_preferred_ide: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,6 +57,13 @@ impl ProjectShelfApp {
             .and_then(|d| d.get_all_projects().ok())
             .unwrap_or_default();
 
+        let all_tags = db
+            .as_ref()
+            .and_then(|d| d.get_all_tags().ok())
+            .unwrap_or_default();
+
+        let settings = load_app_settings();
+
         let mut app = Self {
             projects,
             languages: HashMap::new(),
@@ -62,6 +77,13 @@ impl ProjectShelfApp {
             milestones: HashMap::new(),
             user_meta: HashMap::new(),
             new_milestone_title: String::new(),
+            tags: HashMap::new(),
+            all_tags,
+            new_tag: String::new(),
+            tag_filter: None,
+            show_settings: false,
+            settings_projects_root: settings.projects_root,
+            settings_preferred_ide: settings.preferred_ide,
         };
 
         app.start_scan();
@@ -80,8 +102,13 @@ impl ProjectShelfApp {
         self.scan_tx = Some(trigger_tx);
         self.is_scanning = true;
 
+        let root = if self.settings_projects_root.is_empty() {
+            config::projects_root()
+        } else {
+            std::path::PathBuf::from(&self.settings_projects_root)
+        };
+
         thread::spawn(move || {
-            let root = config::projects_root();
             let projects = scan_projects(&root);
             let _ = result_tx.send(projects);
         });
@@ -98,6 +125,25 @@ impl ProjectShelfApp {
                         let _ = db.upsert_project(&project);
                         let _ = db.upsert_languages(&project.project_id, &lang_breakdown);
                     }
+
+                    // Import YAML on scan
+                    if let Some(pf) = ProjectFile::load(Path::new(&project.path)) {
+                        let yaml_milestones = pf.to_milestones(&project.project_id);
+                        let yaml_meta = pf.to_user_meta(&project.project_id);
+
+                        if let Some(db) = &self.db {
+                            for m in &yaml_milestones {
+                                let _ = db.upsert_milestone(m);
+                            }
+                            // Only import meta if DB has no existing notes
+                            if let Ok(existing) = db.get_user_meta(&project.project_id) {
+                                if existing.notes.is_empty() && !yaml_meta.notes.is_empty() {
+                                    let _ = db.upsert_user_meta(&yaml_meta);
+                                }
+                            }
+                        }
+                    }
+
                     languages.insert(project.project_id.clone(), lang_breakdown);
                     projects.push(project);
                 }
@@ -108,10 +154,15 @@ impl ProjectShelfApp {
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
                     let _ = db.update_scan_state(now);
+
+                    self.all_tags = db.get_all_tags().unwrap_or_default();
                 }
 
                 self.projects = projects;
                 self.languages = languages;
+                self.milestones.clear();
+                self.user_meta.clear();
+                self.tags.clear();
                 self.is_scanning = false;
                 self.scan_rx = None;
             }
@@ -125,9 +176,20 @@ impl ProjectShelfApp {
             .iter()
             .enumerate()
             .filter(|(_, p)| {
-                query.is_empty()
+                let text_match = query.is_empty()
                     || p.name.to_lowercase().contains(&query)
-                    || p.path.to_lowercase().contains(&query)
+                    || p.path.to_lowercase().contains(&query);
+
+                let tag_match = match &self.tag_filter {
+                    Some(tag) => self
+                        .tags
+                        .get(&p.project_id)
+                        .map(|t| t.contains(tag))
+                        .unwrap_or(false),
+                    None => true,
+                };
+
+                text_match && tag_match
             })
             .collect();
 
@@ -143,11 +205,32 @@ impl ProjectShelfApp {
             }
         }
 
+        // Pinned projects float to top
+        let pinned_set: HashSet<String> = self
+            .user_meta
+            .iter()
+            .filter(|(_, m)| m.pinned)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        filtered.sort_by(|a, b| {
+            let a_pinned = pinned_set.contains(&a.1.project_id);
+            let b_pinned = pinned_set.contains(&b.1.project_id);
+            b_pinned.cmp(&a_pinned)
+        });
+
         filtered.into_iter().map(|(idx, _)| idx).collect()
     }
 
     fn render_project_list(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Projects");
+        ui.horizontal(|ui| {
+            ui.heading("Projects");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("⚙").clicked() {
+                    self.show_settings = !self.show_settings;
+                }
+            });
+        });
 
         ui.horizontal(|ui| {
             ui.label("🔍");
@@ -179,7 +262,51 @@ impl ProjectShelfApp {
             }
         });
 
+        if !self.all_tags.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("Tag:");
+                let current = self.tag_filter.as_deref().unwrap_or("All");
+                egui::ComboBox::from_id_source("tag_filter")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(self.tag_filter.is_none(), "All").clicked() {
+                            self.tag_filter = None;
+                        }
+                        for tag in &self.all_tags.clone() {
+                            let selected = self.tag_filter.as_deref() == Some(tag.as_str());
+                            if ui.selectable_label(selected, tag).clicked() {
+                                self.tag_filter = Some(tag.clone());
+                            }
+                        }
+                    });
+            });
+        }
+
         ui.separator();
+
+        // Lazy-load tags for all projects so filter works
+        if self.tags.is_empty() {
+            if let Some(db) = &self.db {
+                for p in &self.projects {
+                    if let Ok(t) = db.get_tags(&p.project_id) {
+                        if !t.is_empty() {
+                            self.tags.insert(p.project_id.clone(), t);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Lazy-load user_meta for pinned sorting
+        if self.user_meta.is_empty() {
+            if let Some(db) = &self.db {
+                for p in &self.projects {
+                    if let Ok(meta) = db.get_user_meta(&p.project_id) {
+                        self.user_meta.insert(p.project_id.clone(), meta);
+                    }
+                }
+            }
+        }
 
         let filtered_indices = self.filtered_project_indices();
         let display_items: Vec<_> = filtered_indices
@@ -188,7 +315,12 @@ impl ProjectShelfApp {
                 self.projects.get(idx).map(|p| {
                     let dirty_badge = if p.dirty { " ●" } else { "" };
                     let branch_info = p.branch.as_deref().unwrap_or("");
-                    (idx, p.icon_kind.emoji().to_string(), p.name.clone(), dirty_badge.to_string(), branch_info.to_string(), p.icon_kind.as_str().to_string())
+                    let pinned = self
+                        .user_meta
+                        .get(&p.project_id)
+                        .map(|m| m.pinned)
+                        .unwrap_or(false);
+                    (idx, p.icon_kind.emoji().to_string(), p.name.clone(), dirty_badge.to_string(), branch_info.to_string(), p.icon_kind.as_str().to_string(), pinned)
                 })
             })
             .collect();
@@ -199,9 +331,12 @@ impl ProjectShelfApp {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
-                for (idx, emoji, name, dirty, branch, icon_kind) in &display_items {
+                for (idx, emoji, name, dirty, branch, icon_kind, pinned) in &display_items {
                     let is_selected = new_selection == Some(*idx);
                     ui.horizontal(|ui| {
+                        if *pinned {
+                            ui.label(egui::RichText::new("📌").size(12.0));
+                        }
                         let icon_color = icon_kind_color(icon_kind);
                         ui.label(egui::RichText::new(emoji).color(icon_color).size(16.0));
                         let label_text = if branch.is_empty() {
@@ -269,15 +404,23 @@ impl ProjectShelfApp {
             }
             if colored_button(ui, "📝 Open in IDE", egui::Color32::from_rgb(86, 156, 214)).clicked() {
                 let path = &project.path;
-                let _ = std::process::Command::new("windsurf")
-                    .arg(path)
-                    .spawn()
-                    .or_else(|_| std::process::Command::new("cursor").arg(path).spawn())
-                    .or_else(|_| std::process::Command::new("code").arg(path).spawn())
-                    .or_else(|_| std::process::Command::new("codium").arg(path).spawn())
-                    .or_else(|_| std::process::Command::new("subl").arg(path).spawn())
-                    .or_else(|_| std::process::Command::new("atom").arg(path).spawn())
-                    .or_else(|_| std::process::Command::new("gedit").arg(path).spawn());
+                let preferred = &self.settings_preferred_ide;
+                if !preferred.is_empty() {
+                    let _ = std::process::Command::new(preferred)
+                        .arg(path)
+                        .spawn()
+                        .or_else(|_| std::process::Command::new("code").arg(path).spawn());
+                } else {
+                    let _ = std::process::Command::new("windsurf")
+                        .arg(path)
+                        .spawn()
+                        .or_else(|_| std::process::Command::new("cursor").arg(path).spawn())
+                        .or_else(|_| std::process::Command::new("code").arg(path).spawn())
+                        .or_else(|_| std::process::Command::new("codium").arg(path).spawn())
+                        .or_else(|_| std::process::Command::new("subl").arg(path).spawn())
+                        .or_else(|_| std::process::Command::new("atom").arg(path).spawn())
+                        .or_else(|_| std::process::Command::new("gedit").arg(path).spawn());
+                }
             }
             if let Some(github_url) = &project.github_url {
                 if colored_button(ui, "🔗 GitHub", egui::Color32::from_rgb(110, 84, 148)).clicked() {
@@ -287,6 +430,91 @@ impl ProjectShelfApp {
                 }
             }
         });
+
+        // Pin toggle and tags
+        ui.separator();
+        {
+            let pid = project.project_id.clone();
+            let meta = self
+                .user_meta
+                .entry(pid.clone())
+                .or_insert_with(|| UserMeta {
+                    project_id: pid.clone(),
+                    pinned: false,
+                    notes: String::new(),
+                });
+
+            ui.horizontal(|ui| {
+                let pin_label = if meta.pinned { "📌 Pinned" } else { "Pin" };
+                if ui.selectable_label(meta.pinned, pin_label).clicked() {
+                    meta.pinned = !meta.pinned;
+                    if let Some(db) = &self.db {
+                        let _ = db.upsert_user_meta(meta);
+                    }
+                }
+            });
+
+            // Tags
+            if !self.tags.contains_key(&pid) {
+                if let Some(db) = &self.db {
+                    if let Ok(t) = db.get_tags(&pid) {
+                        self.tags.insert(pid.clone(), t);
+                    }
+                }
+            }
+
+            let current_tags: Vec<String> = self
+                .tags
+                .get(&pid)
+                .cloned()
+                .unwrap_or_default();
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Tags:");
+                let mut tag_to_remove = None;
+                for tag in &current_tags {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(tag)
+                                .background_color(egui::Color32::from_rgb(60, 80, 120))
+                                .color(egui::Color32::from_rgb(200, 210, 230)),
+                        );
+                        if ui.small_button("×").clicked() {
+                            tag_to_remove = Some(tag.clone());
+                        }
+                    });
+                }
+                if let Some(tag) = tag_to_remove {
+                    if let Some(db) = &self.db {
+                        let _ = db.remove_tag(&pid, &tag);
+                    }
+                    if let Some(t) = self.tags.get_mut(&pid) {
+                        t.retain(|x| x != &tag);
+                    }
+                    self.all_tags = self
+                        .db
+                        .as_ref()
+                        .and_then(|d| d.get_all_tags().ok())
+                        .unwrap_or_default();
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.new_tag);
+                if ui.small_button("+ Tag").clicked() && !self.new_tag.trim().is_empty() {
+                    let tag = self.new_tag.trim().to_lowercase();
+                    if let Some(db) = &self.db {
+                        let _ = db.add_tag(&pid, &tag);
+                    }
+                    self.tags.entry(pid.clone()).or_default().push(tag.clone());
+                    if !self.all_tags.contains(&tag) {
+                        self.all_tags.push(tag);
+                        self.all_tags.sort();
+                    }
+                    self.new_tag.clear();
+                }
+            });
+        }
 
         ui.separator();
 
@@ -541,6 +769,47 @@ impl ProjectShelfApp {
         let proj_file = ProjectFile::from_data(&milestones, &user_meta);
         let _ = proj_file.save(Path::new(project_path));
     }
+
+    fn render_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        ui.separator();
+
+        ui.label("Projects Root Directory:");
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.settings_projects_root);
+        });
+        ui.label(
+            egui::RichText::new("Leave empty to use default ~/Projects")
+                .color(egui::Color32::GRAY)
+                .small(),
+        );
+
+        ui.add_space(10.0);
+
+        ui.label("Preferred IDE (command name):");
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.settings_preferred_ide);
+        });
+        ui.label(
+            egui::RichText::new("e.g. windsurf, cursor, code, codium, subl")
+                .color(egui::Color32::GRAY)
+                .small(),
+        );
+
+        ui.add_space(15.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("💾 Save Settings").clicked() {
+                save_app_settings(&AppSettings {
+                    projects_root: self.settings_projects_root.clone(),
+                    preferred_ide: self.settings_preferred_ide.clone(),
+                });
+            }
+            if ui.button("Close").clicked() {
+                self.show_settings = false;
+            }
+        });
+    }
 }
 
 impl eframe::App for ProjectShelfApp {
@@ -560,7 +829,11 @@ impl eframe::App for ProjectShelfApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.render_project_details(ui);
+            if self.show_settings {
+                self.render_settings(ui);
+            } else {
+                self.render_project_details(ui);
+            }
         });
     }
 }
@@ -670,6 +943,52 @@ fn colored_button(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::
         egui::RichText::new(text).color(egui::Color32::from_rgb(230, 230, 230))
     ).fill(color);
     ui.add(button)
+}
+
+struct AppSettings {
+    projects_root: String,
+    preferred_ide: String,
+}
+
+fn settings_path() -> std::path::PathBuf {
+    config::data_dir().join("settings.toml")
+}
+
+fn load_app_settings() -> AppSettings {
+    let path = settings_path();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let mut projects_root = String::new();
+        let mut preferred_ide = String::new();
+        for line in content.lines() {
+            if let Some(val) = line.strip_prefix("projects_root = ") {
+                projects_root = val.trim_matches('"').to_string();
+            }
+            if let Some(val) = line.strip_prefix("preferred_ide = ") {
+                preferred_ide = val.trim_matches('"').to_string();
+            }
+        }
+        AppSettings {
+            projects_root,
+            preferred_ide,
+        }
+    } else {
+        AppSettings {
+            projects_root: config::projects_root().to_string_lossy().to_string(),
+            preferred_ide: String::new(),
+        }
+    }
+}
+
+fn save_app_settings(settings: &AppSettings) {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let content = format!(
+        "projects_root = \"{}\"\npreferred_ide = \"{}\"\n",
+        settings.projects_root, settings.preferred_ide
+    );
+    let _ = std::fs::write(path, content);
 }
 
 fn configure_fonts(ctx: &egui::Context) {

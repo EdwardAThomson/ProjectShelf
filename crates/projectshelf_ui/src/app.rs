@@ -35,6 +35,11 @@ pub struct ProjectShelfApp {
     watch_rx: Option<Receiver<Vec<(Project, LanguageBreakdown)>>>,
     /// Parsed checklist per project_id, re-read on scan/watch (None = no list).
     task_cache: HashMap<String, Option<Checklist>>,
+    /// Cached project-list rows + the inputs they were built for. Bumping
+    /// `list_version` (on data changes) or changing search/sort/filter rebuilds.
+    list_version: u64,
+    list_cache: Vec<ListRow>,
+    list_key: Option<(u64, String, SortMode, Option<String>)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,6 +55,21 @@ enum DetailTab {
     Overview,
     Roadmap,
     Notes,
+}
+
+/// Precomputed display data for one project-list row, so the list isn't rebuilt
+/// (and tooltip strings re-allocated) on every frame — only when the underlying
+/// data, search, sort, or filter changes.
+struct ListRow {
+    idx: usize,
+    emoji: String,
+    name: String,
+    dirty: bool,
+    icon_color: egui::Color32,
+    pinned: bool,
+    task_badge: String,
+    task_color: egui::Color32,
+    tip: String,
 }
 
 impl SortMode {
@@ -101,6 +121,9 @@ impl ProjectShelfApp {
             export_status: String::new(),
             watch_rx: None,
             task_cache: HashMap::new(),
+            list_version: 0,
+            list_cache: Vec::new(),
+            list_key: None,
         };
 
         app.start_scan();
@@ -187,6 +210,7 @@ impl ProjectShelfApp {
                 self.user_meta.clear();
                 self.tags.clear();
                 self.task_cache.clear();
+                self.list_version = self.list_version.wrapping_add(1);
                 self.is_scanning = false;
                 self.scan_rx = None;
             }
@@ -201,6 +225,9 @@ impl ProjectShelfApp {
             None => return,
         };
 
+        if !updates.is_empty() {
+            self.list_version = self.list_version.wrapping_add(1);
+        }
         for batch in updates {
             for (project, breakdown) in batch {
                 if let Some(db) = &self.db {
@@ -365,15 +392,15 @@ impl ProjectShelfApp {
 
         ui.separator();
 
-        // Lazy-load tags for all projects so filter works
-        if self.tags.is_empty() {
+        // Load each project's tags once. Insert an entry for every project (even
+        // when it has no tags) so the map becomes non-empty after the first pass —
+        // otherwise, when no project has tags, this would re-query the DB for all
+        // projects on every frame and make scrolling janky.
+        if self.tags.is_empty() && !self.projects.is_empty() {
             if let Some(db) = &self.db {
                 for p in &self.projects {
-                    if let Ok(t) = db.get_tags(&p.project_id) {
-                        if !t.is_empty() {
-                            self.tags.insert(p.project_id.clone(), t);
-                        }
-                    }
+                    let t = db.get_tags(&p.project_id).unwrap_or_default();
+                    self.tags.insert(p.project_id.clone(), t);
                 }
             }
         }
@@ -389,55 +416,18 @@ impl ProjectShelfApp {
             }
         }
 
-        let filtered_indices = self.filtered_project_indices();
-        let display_items: Vec<_> = filtered_indices
-            .iter()
-            .filter_map(|&idx| {
-                self.projects.get(idx).map(|p| {
-                    let dirty_badge = if p.dirty { " ●" } else { "" };
-                    let pinned = self
-                        .user_meta
-                        .get(&p.project_id)
-                        .map(|m| m.pinned)
-                        .unwrap_or(false);
-                    let task_badge = if p.tasks.total > 0 {
-                        format!("{}/{}", p.tasks.done, p.tasks.total)
-                    } else {
-                        String::new()
-                    };
-                    let task_color = roadmap_badge_color(p.tasks.done, p.tasks.total);
-
-                    // Icon tinted by main language (falls back to project type).
-                    let icon_color = match p.primary_language.as_deref() {
-                        Some(lang) => language_color(lang),
-                        None => icon_kind_color(p.icon_kind.as_str()),
-                    };
-
-                    // Rich hover tooltip.
-                    let mut tip = p.name.clone();
-                    tip.push_str(&format!(
-                        "\nLanguage: {}",
-                        p.primary_language.as_deref().unwrap_or("—")
-                    ));
-                    if let Some(b) = &p.branch {
-                        tip.push_str(&format!("\nBranch: {b}"));
-                    }
-                    let when = p
-                        .last_commit_ts
-                        .map(format_timestamp)
-                        .unwrap_or_else(|| "—".to_string());
-                    tip.push_str(&format!("\nLast commit: {when}"));
-                    if p.tasks.total > 0 {
-                        tip.push_str(&format!("\nRoadmap: {}/{}", p.tasks.done, p.tasks.total));
-                    }
-                    if p.dirty {
-                        tip.push_str("\n● Uncommitted changes");
-                    }
-
-                    (idx, p.icon_kind.emoji().to_string(), p.name.clone(), dirty_badge.to_string(), icon_color, pinned, task_badge, task_color, tip)
-                })
-            })
-            .collect();
+        // Rebuild the cached rows only when the data / search / sort / filter
+        // changed — not every frame.
+        let key = (
+            self.list_version,
+            self.search_query.clone(),
+            self.sort_mode,
+            self.tag_filter.clone(),
+        );
+        if self.list_key.as_ref() != Some(&key) {
+            self.rebuild_list_rows();
+            self.list_key = Some(key);
+        }
 
         let mut new_selection = self.selected_idx;
 
@@ -445,38 +435,102 @@ impl ProjectShelfApp {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
-                for (idx, emoji, name, dirty, icon_color, pinned, task_badge, task_color, tip) in &display_items {
-                    let is_selected = new_selection == Some(*idx);
-                    let row = ui.horizontal(|ui| {
-                        if *pinned {
+                for row in &self.list_cache {
+                    let is_selected = new_selection == Some(row.idx);
+                    let resp = ui.horizontal(|ui| {
+                        if row.pinned {
                             ui.label(egui::RichText::new("📌").size(12.0));
                         }
-                        ui.label(egui::RichText::new(emoji).color(*icon_color).size(16.0))
-                            .on_hover_ui(|ui| tooltip_body(ui, tip));
+                        ui.label(egui::RichText::new(&row.emoji).color(row.icon_color).size(16.0))
+                            .on_hover_ui(|ui| tooltip_body(ui, &row.tip));
                         if ui
-                            .selectable_label(is_selected, name)
-                            .on_hover_ui(|ui| tooltip_body(ui, tip))
+                            .selectable_label(is_selected, &row.name)
+                            .on_hover_ui(|ui| tooltip_body(ui, &row.tip))
                             .clicked()
                         {
-                            new_selection = Some(*idx);
+                            new_selection = Some(row.idx);
                         }
-                        if !dirty.is_empty() {
-                            ui.label(egui::RichText::new(dirty).color(egui::Color32::from_rgb(255, 150, 50)));
-                        }
-                        if !task_badge.is_empty() {
+                        if row.dirty {
                             ui.label(
-                                egui::RichText::new(format!("☑ {task_badge}"))
-                                    .color(*task_color)
+                                egui::RichText::new("●")
+                                    .color(egui::Color32::from_rgb(255, 150, 50)),
+                            );
+                        }
+                        if !row.task_badge.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("☑ {}", row.task_badge))
+                                    .color(row.task_color)
                                     .small(),
                             );
                         }
                     });
                     // Whole-row hover (covers the gaps between widgets too).
-                    row.response.on_hover_ui(|ui| tooltip_body(ui, tip));
+                    resp.response.on_hover_ui(|ui| tooltip_body(ui, &row.tip));
                 }
             });
 
         self.selected_idx = new_selection;
+    }
+
+    /// Rebuild `list_cache` from the current projects / filter / sort. Called
+    /// only when inputs change (tracked by `list_key`), so the per-row work —
+    /// including building the tooltip strings — doesn't run every frame.
+    fn rebuild_list_rows(&mut self) {
+        let indices = self.filtered_project_indices();
+        let mut rows = Vec::with_capacity(indices.len());
+        for idx in indices {
+            let Some(p) = self.projects.get(idx) else {
+                continue;
+            };
+            let pinned = self
+                .user_meta
+                .get(&p.project_id)
+                .map(|m| m.pinned)
+                .unwrap_or(false);
+            let task_badge = if p.tasks.total > 0 {
+                format!("{}/{}", p.tasks.done, p.tasks.total)
+            } else {
+                String::new()
+            };
+            let task_color = roadmap_badge_color(p.tasks.done, p.tasks.total);
+            let icon_color = match p.primary_language.as_deref() {
+                Some(lang) => language_color(lang),
+                None => icon_kind_color(p.icon_kind.as_str()),
+            };
+
+            let mut tip = p.name.clone();
+            tip.push_str(&format!(
+                "\nLanguage: {}",
+                p.primary_language.as_deref().unwrap_or("—")
+            ));
+            if let Some(b) = &p.branch {
+                tip.push_str(&format!("\nBranch: {b}"));
+            }
+            let when = p
+                .last_commit_ts
+                .map(format_timestamp)
+                .unwrap_or_else(|| "—".to_string());
+            tip.push_str(&format!("\nLast commit: {when}"));
+            if p.tasks.total > 0 {
+                tip.push_str(&format!("\nRoadmap: {}/{}", p.tasks.done, p.tasks.total));
+            }
+            if p.dirty {
+                tip.push_str("\n● Uncommitted changes");
+            }
+
+            rows.push(ListRow {
+                idx,
+                emoji: p.icon_kind.emoji().to_string(),
+                name: p.name.clone(),
+                dirty: p.dirty,
+                icon_color,
+                pinned,
+                task_badge,
+                task_color,
+                tip,
+            });
+        }
+        self.list_cache = rows;
     }
 
     fn build_export_row(&self, p: &Project) -> ExportRow {
@@ -580,6 +634,7 @@ impl ProjectShelfApp {
             if let Some(db) = &self.db {
                 let _ = db.upsert_user_meta(meta);
             }
+            self.list_version = self.list_version.wrapping_add(1);
         }
 
         ui.separator();
@@ -813,6 +868,7 @@ impl ProjectShelfApp {
                     .as_ref()
                     .and_then(|d| d.get_all_tags().ok())
                     .unwrap_or_default();
+                self.list_version = self.list_version.wrapping_add(1);
             }
         });
 
@@ -829,6 +885,7 @@ impl ProjectShelfApp {
                     self.all_tags.sort();
                 }
                 self.new_tag.clear();
+                self.list_version = self.list_version.wrapping_add(1);
             }
         });
     }

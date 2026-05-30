@@ -95,6 +95,13 @@ fn scan_for_languages(path: &Path, depth: usize, lang_bytes: &mut HashMap<String
 }
 
 fn extension_to_language(path: &Path) -> Option<&'static str> {
+    // Compiler-generated Make dependency files (e.g. `foo.cpp.o.d`) share the
+    // `.d` extension with D source — skip them so C/C++ projects aren't
+    // mislabeled as D. Real D source (`foo.d`) is unaffected.
+    if path.file_name()?.to_str()?.ends_with(".o.d") {
+        return None;
+    }
+
     let ext = path.extension()?.to_str()?.to_lowercase();
     let ext_str = ext.as_str();
 
@@ -181,5 +188,18 @@ mod tests {
     fn primary_language_normal_case() {
         let b = breakdown(&[("Rust", 1_000), ("TOML", 100)]);
         assert_eq!(b.primary_language(), Some("Rust"));
+    }
+
+    #[test]
+    fn cmake_dependency_files_are_not_d() {
+        // `*.o.d` are compiler dependency files, not D source.
+        assert_eq!(
+            extension_to_language(Path::new("position_utils.cpp.o.d")),
+            None
+        );
+        // Real D source still detected.
+        assert_eq!(extension_to_language(Path::new("main.d")), Some("D"));
+        // Normal C++ unaffected.
+        assert_eq!(extension_to_language(Path::new("main.cpp")), Some("C++"));
     }
 }

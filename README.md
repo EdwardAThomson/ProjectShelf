@@ -112,12 +112,7 @@ ProjectShelf/
 
 ## Roadmap
 
-- [x] **M1** — Project discovery + cached list
-- [x] **M2** — Git metadata + activity sorting
-- [x] **M3** — Language detection with byte counts
-- [x] **M4** — Milestones + notes per project
-- [x] **M5** — GitHub remote integration
-- [x] **M6** — Tags, pinned projects, YAML import, settings
+See [`ROADMAP.md`](ROADMAP.md) — the canonical roadmap (M1–M10 shipped; what's next + backlog).
 
 ## Tech Stack
 

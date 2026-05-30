@@ -9,9 +9,20 @@ pub struct LanguageBreakdown {
     pub total_bytes: u64,
 }
 
+/// Languages excluded from being reported as a project's *primary* language —
+/// data/config formats that often dominate by bytes (e.g. a giant
+/// `package-lock.json`) but don't characterize the codebase. They still appear
+/// in the full breakdown / `top_n`.
+const NON_PRIMARY_LANGUAGES: &[&str] = &["JSON"];
+
 impl LanguageBreakdown {
+    /// The top language by bytes, skipping non-code data formats
+    /// ([`NON_PRIMARY_LANGUAGES`]). `None` if there's no real code language.
     pub fn primary_language(&self) -> Option<&str> {
-        self.languages.first().map(|(lang, _)| lang.as_str())
+        self.languages
+            .iter()
+            .map(|(lang, _)| lang.as_str())
+            .find(|lang| !NON_PRIMARY_LANGUAGES.contains(lang))
     }
 
     pub fn top_n(&self, n: usize) -> Vec<(&str, u64, f32)> {
@@ -139,5 +150,36 @@ fn extension_to_language(path: &Path) -> Option<&'static str> {
         "dockerfile" => Some("Dockerfile"),
         "makefile" => Some("Makefile"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn breakdown(items: &[(&str, u64)]) -> LanguageBreakdown {
+        let languages: Vec<(String, u64)> =
+            items.iter().map(|(l, b)| (l.to_string(), *b)).collect();
+        let total_bytes = languages.iter().map(|(_, b)| *b).sum();
+        LanguageBreakdown { languages, total_bytes }
+    }
+
+    #[test]
+    fn primary_language_skips_json() {
+        // JSON dominates by bytes but Rust should be reported as primary.
+        let b = breakdown(&[("JSON", 1_000), ("Rust", 500)]);
+        assert_eq!(b.primary_language(), Some("Rust"));
+    }
+
+    #[test]
+    fn primary_language_none_when_only_json() {
+        let b = breakdown(&[("JSON", 1_000)]);
+        assert_eq!(b.primary_language(), None);
+    }
+
+    #[test]
+    fn primary_language_normal_case() {
+        let b = breakdown(&[("Rust", 1_000), ("TOML", 100)]);
+        assert_eq!(b.primary_language(), Some("Rust"));
     }
 }

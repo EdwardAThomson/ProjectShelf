@@ -206,10 +206,10 @@ Tables (logical):
 ## 14. Future Enhancements
 
 * GitHub issues/PR summary
-* “Health checks” (README/license/tests/CI)
+* ~~“Health checks” (README/license/tests/CI)~~ — done
 * Project templates + init
-* Export report (markdown/csv)
-* File watcher for incremental updates
+* ~~Export report (markdown/csv)~~ — done
+* ~~File watcher for incremental updates~~ — done
 * Plugin system (custom detectors)
 
 ---

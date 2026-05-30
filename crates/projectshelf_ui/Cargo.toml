@@ -11,3 +11,4 @@ path = "src/main.rs"
 projectshelf_core = { path = "../projectshelf_core" }
 eframe = "0.28"
 egui = "0.28"
+notify = "6"

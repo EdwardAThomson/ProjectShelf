@@ -6,6 +6,7 @@ pub mod git;
 pub mod fs_activity;
 pub mod languages;
 pub mod projfile;
+pub mod checklist;
 
 pub use models::*;
 pub use discover::*;
@@ -15,3 +16,4 @@ pub use git::*;
 pub use fs_activity::*;
 pub use languages::*;
 pub use projfile::*;
+pub use checklist::*;

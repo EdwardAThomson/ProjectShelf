@@ -1,13 +1,16 @@
 use eframe::egui;
+use notify::{RecursiveMode, Watcher};
 use projectshelf_core::{
-    config, scan_projects, Database, LanguageBreakdown, Milestone, MilestoneStatus, Project,
-    ProjectFile, UserMeta,
+    config, discover_projects, find_project_root, parse_checklist, scan_projects,
+    scan_single_project, Checklist, Database, LanguageBreakdown, Project, ProjectFile, UserMeta,
+    IGNORED_DIRS,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
+use std::time::Duration;
 
 pub struct ProjectShelfApp {
     projects: Vec<Project>,
@@ -19,9 +22,8 @@ pub struct ProjectShelfApp {
     scan_tx: Option<Sender<()>>,
     is_scanning: bool,
     sort_mode: SortMode,
-    milestones: HashMap<String, Vec<Milestone>>,
+    detail_tab: DetailTab,
     user_meta: HashMap<String, UserMeta>,
-    new_milestone_title: String,
     tags: HashMap<String, Vec<String>>,
     all_tags: Vec<String>,
     new_tag: String,
@@ -29,6 +31,10 @@ pub struct ProjectShelfApp {
     show_settings: bool,
     settings_projects_root: String,
     settings_preferred_ide: String,
+    export_status: String,
+    watch_rx: Option<Receiver<Vec<(Project, LanguageBreakdown)>>>,
+    /// Parsed checklist per project_id, re-read on scan/watch (None = no list).
+    task_cache: HashMap<String, Option<Checklist>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,6 +42,14 @@ enum SortMode {
     RecentActivity,
     MostStale,
     Alphabetical,
+}
+
+/// Tabs within the details panel for the selected project.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetailTab {
+    Overview,
+    Roadmap,
+    Notes,
 }
 
 impl SortMode {
@@ -51,6 +65,7 @@ impl SortMode {
 impl ProjectShelfApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_fonts(&cc.egui_ctx);
+        configure_style(&cc.egui_ctx);
         let db = Database::open().ok();
         let projects = db
             .as_ref()
@@ -74,9 +89,8 @@ impl ProjectShelfApp {
             scan_tx: None,
             is_scanning: false,
             sort_mode: SortMode::RecentActivity,
-            milestones: HashMap::new(),
+            detail_tab: DetailTab::Overview,
             user_meta: HashMap::new(),
-            new_milestone_title: String::new(),
             tags: HashMap::new(),
             all_tags,
             new_tag: String::new(),
@@ -84,10 +98,25 @@ impl ProjectShelfApp {
             show_settings: false,
             settings_projects_root: settings.projects_root,
             settings_preferred_ide: settings.preferred_ide,
+            export_status: String::new(),
+            watch_rx: None,
+            task_cache: HashMap::new(),
         };
 
         app.start_scan();
+        app.start_watcher(cc.egui_ctx.clone());
         app
+    }
+
+    /// Spawn a background thread that watches the projects root and pushes
+    /// incremental re-scans of changed projects over a channel.
+    fn start_watcher(&mut self, ctx: egui::Context) {
+        let root = if self.settings_projects_root.is_empty() {
+            config::projects_root()
+        } else {
+            PathBuf::from(&self.settings_projects_root)
+        };
+        self.watch_rx = Some(spawn_watcher(root, ctx));
     }
 
     fn start_scan(&mut self) {
@@ -126,16 +155,11 @@ impl ProjectShelfApp {
                         let _ = db.upsert_languages(&project.project_id, &lang_breakdown);
                     }
 
-                    // Import YAML on scan
+                    // Import notes from YAML on scan (DB is otherwise the source
+                    // of truth — only fill in when the DB has no notes yet).
                     if let Some(pf) = ProjectFile::load(Path::new(&project.path)) {
-                        let yaml_milestones = pf.to_milestones(&project.project_id);
                         let yaml_meta = pf.to_user_meta(&project.project_id);
-
                         if let Some(db) = &self.db {
-                            for m in &yaml_milestones {
-                                let _ = db.upsert_milestone(m);
-                            }
-                            // Only import meta if DB has no existing notes
                             if let Ok(existing) = db.get_user_meta(&project.project_id) {
                                 if existing.notes.is_empty() && !yaml_meta.notes.is_empty() {
                                     let _ = db.upsert_user_meta(&yaml_meta);
@@ -160,11 +184,50 @@ impl ProjectShelfApp {
 
                 self.projects = projects;
                 self.languages = languages;
-                self.milestones.clear();
                 self.user_meta.clear();
                 self.tags.clear();
+                self.task_cache.clear();
                 self.is_scanning = false;
                 self.scan_rx = None;
+            }
+        }
+    }
+
+    /// Drain incremental updates from the file watcher and merge them into the
+    /// in-memory project list (and DB), without a full rescan.
+    fn check_watch_results(&mut self) {
+        let updates: Vec<Vec<(Project, LanguageBreakdown)>> = match &self.watch_rx {
+            Some(rx) => rx.try_iter().collect(),
+            None => return,
+        };
+
+        for batch in updates {
+            for (project, breakdown) in batch {
+                if let Some(db) = &self.db {
+                    let _ = db.upsert_project(&project);
+                    let _ = db.upsert_languages(&project.project_id, &breakdown);
+
+                    // Import notes from YAML, mirroring check_scan_results.
+                    if let Some(pf) = ProjectFile::load(Path::new(&project.path)) {
+                        let yaml_meta = pf.to_user_meta(&project.project_id);
+                        if let Ok(existing) = db.get_user_meta(&project.project_id) {
+                            if existing.notes.is_empty() && !yaml_meta.notes.is_empty() {
+                                let _ = db.upsert_user_meta(&yaml_meta);
+                            }
+                        }
+                    }
+                }
+
+                self.languages.insert(project.project_id.clone(), breakdown);
+                self.task_cache.remove(&project.project_id);
+                match self
+                    .projects
+                    .iter()
+                    .position(|p| p.project_id == project.project_id)
+                {
+                    Some(idx) => self.projects[idx] = project,
+                    None => self.projects.push(project),
+                }
             }
         }
     }
@@ -260,7 +323,25 @@ impl ProjectShelfApp {
             } else if ui.button("⟳ Refresh").clicked() {
                 self.start_scan();
             }
+            ui.menu_button("⬇ Export", |ui| {
+                if ui.button("Markdown (.md)").clicked() {
+                    self.export_report(ExportFormat::Markdown);
+                    ui.close_menu();
+                }
+                if ui.button("CSV (.csv)").clicked() {
+                    self.export_report(ExportFormat::Csv);
+                    ui.close_menu();
+                }
+            });
         });
+
+        if !self.export_status.is_empty() {
+            ui.label(
+                egui::RichText::new(&self.export_status)
+                    .color(egui::Color32::from_rgb(100, 200, 100))
+                    .small(),
+            );
+        }
 
         if !self.all_tags.is_empty() {
             ui.horizontal(|ui| {
@@ -314,13 +395,46 @@ impl ProjectShelfApp {
             .filter_map(|&idx| {
                 self.projects.get(idx).map(|p| {
                     let dirty_badge = if p.dirty { " ●" } else { "" };
-                    let branch_info = p.branch.as_deref().unwrap_or("");
                     let pinned = self
                         .user_meta
                         .get(&p.project_id)
                         .map(|m| m.pinned)
                         .unwrap_or(false);
-                    (idx, p.icon_kind.emoji().to_string(), p.name.clone(), dirty_badge.to_string(), branch_info.to_string(), p.icon_kind.as_str().to_string(), pinned)
+                    let task_badge = if p.tasks.total > 0 {
+                        format!("{}/{}", p.tasks.done, p.tasks.total)
+                    } else {
+                        String::new()
+                    };
+                    let task_color = roadmap_badge_color(p.tasks.done, p.tasks.total);
+
+                    // Icon tinted by main language (falls back to project type).
+                    let icon_color = match p.primary_language.as_deref() {
+                        Some(lang) => language_color(lang),
+                        None => icon_kind_color(p.icon_kind.as_str()),
+                    };
+
+                    // Rich hover tooltip.
+                    let mut tip = p.name.clone();
+                    tip.push_str(&format!(
+                        "\nLanguage: {}",
+                        p.primary_language.as_deref().unwrap_or("—")
+                    ));
+                    if let Some(b) = &p.branch {
+                        tip.push_str(&format!("\nBranch: {b}"));
+                    }
+                    let when = p
+                        .last_commit_ts
+                        .map(format_timestamp)
+                        .unwrap_or_else(|| "—".to_string());
+                    tip.push_str(&format!("\nLast commit: {when}"));
+                    if p.tasks.total > 0 {
+                        tip.push_str(&format!("\nRoadmap: {}/{}", p.tasks.done, p.tasks.total));
+                    }
+                    if p.dirty {
+                        tip.push_str("\n● Uncommitted changes");
+                    }
+
+                    (idx, p.icon_kind.emoji().to_string(), p.name.clone(), dirty_badge.to_string(), icon_color, pinned, task_badge, task_color, tip)
                 })
             })
             .collect();
@@ -331,31 +445,95 @@ impl ProjectShelfApp {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 6.0;
-                for (idx, emoji, name, dirty, branch, icon_kind, pinned) in &display_items {
+                for (idx, emoji, name, dirty, icon_color, pinned, task_badge, task_color, tip) in &display_items {
                     let is_selected = new_selection == Some(*idx);
-                    ui.horizontal(|ui| {
+                    let row = ui.horizontal(|ui| {
                         if *pinned {
                             ui.label(egui::RichText::new("📌").size(12.0));
                         }
-                        let icon_color = icon_kind_color(icon_kind);
-                        ui.label(egui::RichText::new(emoji).color(icon_color).size(16.0));
-                        let label_text = if branch.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{} [{}]", name, branch)
-                        };
-                        let response = ui.selectable_label(is_selected, &label_text);
+                        ui.label(egui::RichText::new(emoji).color(*icon_color).size(16.0))
+                            .on_hover_ui(|ui| tooltip_body(ui, tip));
+                        if ui
+                            .selectable_label(is_selected, name)
+                            .on_hover_ui(|ui| tooltip_body(ui, tip))
+                            .clicked()
+                        {
+                            new_selection = Some(*idx);
+                        }
                         if !dirty.is_empty() {
                             ui.label(egui::RichText::new(dirty).color(egui::Color32::from_rgb(255, 150, 50)));
                         }
-                        if response.clicked() {
-                            new_selection = Some(*idx);
+                        if !task_badge.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!("☑ {task_badge}"))
+                                    .color(*task_color)
+                                    .small(),
+                            );
                         }
                     });
+                    // Whole-row hover (covers the gaps between widgets too).
+                    row.response.on_hover_ui(|ui| tooltip_body(ui, tip));
                 }
             });
 
         self.selected_idx = new_selection;
+    }
+
+    fn build_export_row(&self, p: &Project) -> ExportRow {
+        let tags = self
+            .db
+            .as_ref()
+            .and_then(|db| db.get_tags(&p.project_id).ok())
+            .unwrap_or_default();
+        ExportRow {
+            name: p.name.clone(),
+            path: p.path.clone(),
+            language: p.primary_language.clone().unwrap_or_default(),
+            branch: p.branch.clone().unwrap_or_default(),
+            dirty: p.dirty,
+            last_commit: p.last_commit_ts.map(format_timestamp).unwrap_or_default(),
+            tags: tags.join(" "),
+            health: p.health,
+        }
+    }
+
+    /// Write `rows` to `<stem>.{md,csv}` in the app data dir, recording the
+    /// outcome in `export_status`. `label` is used in the success message.
+    fn write_export(&mut self, rows: &[ExportRow], format: ExportFormat, stem: &str, label: &str) {
+        let content = match format {
+            ExportFormat::Markdown => render_markdown(rows),
+            ExportFormat::Csv => render_csv(rows),
+        };
+        let ext = match format {
+            ExportFormat::Markdown => "md",
+            ExportFormat::Csv => "csv",
+        };
+        let dir = config::data_dir();
+        let out_path = dir.join(format!("{stem}.{ext}"));
+
+        self.export_status = match std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&out_path, content))
+        {
+            Ok(()) => format!("Exported {label} → {}", out_path.display()),
+            Err(e) => format!("Export failed: {e}"),
+        };
+    }
+
+    fn export_report(&mut self, format: ExportFormat) {
+        let rows: Vec<ExportRow> = self
+            .projects
+            .iter()
+            .map(|p| self.build_export_row(p))
+            .collect();
+        let label = format!("{} projects", rows.len());
+        self.write_export(&rows, format, "projectshelf-report", &label);
+    }
+
+    fn export_single(&mut self, format: ExportFormat, project: &Project) {
+        let row = self.build_export_row(project);
+        let stem = format!("project-{}", sanitize_filename(&project.name));
+        let label = project.name.clone();
+        self.write_export(&[row], format, &stem, &label);
     }
 
     fn render_project_details(&mut self, ui: &mut egui::Ui) {
@@ -369,13 +547,40 @@ impl ProjectShelfApp {
             }
         };
 
+        let pid = project.project_id.clone();
+        let is_pinned = self.user_meta.get(&pid).map(|m| m.pinned).unwrap_or(false);
+        let mut toggle_pin = false;
         ui.horizontal(|ui| {
             ui.heading(format!("{} {}", project.icon_kind.emoji(), project.name));
             if project.dirty {
-                ui.label(egui::RichText::new(" ●").color(egui::Color32::from_rgb(255, 150, 50)));
+                ui.label(egui::RichText::new("●").color(egui::Color32::from_rgb(255, 150, 50)));
             }
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(&project.path)
+                    .color(egui::Color32::GRAY)
+                    .small(),
+            );
+            // Pin floats to the top-right of the panel.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let pin_label = if is_pinned { "📌 Pinned" } else { "📌 Pin" };
+                if ui.selectable_label(is_pinned, pin_label).clicked() {
+                    toggle_pin = true;
+                }
+            });
         });
-        ui.label(egui::RichText::new(&project.path).color(egui::Color32::GRAY));
+
+        if toggle_pin {
+            let meta = self.user_meta.entry(pid.clone()).or_insert_with(|| UserMeta {
+                project_id: pid.clone(),
+                pinned: false,
+                notes: String::new(),
+            });
+            meta.pinned = !meta.pinned;
+            if let Some(db) = &self.db {
+                let _ = db.upsert_user_meta(meta);
+            }
+        }
 
         ui.separator();
 
@@ -431,134 +636,84 @@ impl ProjectShelfApp {
             }
         });
 
-        // Pin toggle and tags
+        ui.add_space(6.0);
+
+        // Per-project tabs. Own the project so the tab bodies can take `&mut self`.
+        let project = project.clone();
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.detail_tab, DetailTab::Overview, "Overview");
+            ui.selectable_value(&mut self.detail_tab, DetailTab::Roadmap, "Roadmap");
+            ui.selectable_value(&mut self.detail_tab, DetailTab::Notes, "Notes");
+        });
         ui.separator();
-        {
-            let pid = project.project_id.clone();
-            let meta = self
-                .user_meta
-                .entry(pid.clone())
-                .or_insert_with(|| UserMeta {
-                    project_id: pid.clone(),
-                    pinned: false,
-                    notes: String::new(),
+
+        match self.detail_tab {
+            DetailTab::Overview => self.render_overview(ui, &project),
+            DetailTab::Roadmap => self.render_roadmap(ui, &project.project_id, &project.path),
+            DetailTab::Notes => self.render_notes(ui, &project.project_id, &project.path),
+        }
+    }
+
+    /// "Overview" tab: activity + health side by side, languages, export, and a
+    /// collapsed tags editor.
+    fn render_overview(&mut self, ui: &mut egui::Ui, project: &Project) {
+        // Activity (left) and Health (right), side by side.
+        ui.columns(2, |cols| {
+            cols[0].heading("Activity");
+            egui::Grid::new("activity_grid")
+                .num_columns(2)
+                .spacing([16.0, 4.0])
+                .show(&mut cols[0], |ui| {
+                    ui.label("Last Seen:");
+                    ui.label(format_timestamp(project.last_seen));
+                    ui.end_row();
+
+                    if let Some(ts) = project.last_commit_ts {
+                        ui.label("Last Commit:");
+                        ui.label(format_timestamp(ts));
+                        ui.end_row();
+                    }
+
+                    if let Some(ts) = project.last_fs_activity_ts {
+                        ui.label("Last FS Activity:");
+                        ui.label(format_timestamp(ts));
+                        ui.end_row();
+                    }
+
+                    if let Some(branch) = &project.branch {
+                        ui.label("Branch:");
+                        ui.label(branch);
+                        ui.end_row();
+                    }
+
+                    ui.label("Dirty:");
+                    if project.dirty {
+                        ui.label(
+                            egui::RichText::new("Yes ●")
+                                .color(egui::Color32::from_rgb(255, 150, 50)),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("No ✓")
+                                .color(egui::Color32::from_rgb(100, 200, 100)),
+                        );
+                    }
+                    ui.end_row();
                 });
 
-            ui.horizontal(|ui| {
-                let pin_label = if meta.pinned { "📌 Pinned" } else { "Pin" };
-                if ui.selectable_label(meta.pinned, pin_label).clicked() {
-                    meta.pinned = !meta.pinned;
-                    if let Some(db) = &self.db {
-                        let _ = db.upsert_user_meta(meta);
-                    }
-                }
-            });
+            cols[1].heading("Health");
+            let health = project.health;
+            health_badge(&mut cols[1], "README", health.has_readme);
+            health_badge(&mut cols[1], "License", health.has_license);
+            health_badge(&mut cols[1], "Tests", health.has_tests);
+            health_badge(&mut cols[1], "CI", health.has_ci);
+        });
 
-            // Tags
-            if !self.tags.contains_key(&pid) {
-                if let Some(db) = &self.db {
-                    if let Ok(t) = db.get_tags(&pid) {
-                        self.tags.insert(pid.clone(), t);
-                    }
-                }
-            }
-
-            let current_tags: Vec<String> = self
-                .tags
-                .get(&pid)
-                .cloned()
-                .unwrap_or_default();
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Tags:");
-                let mut tag_to_remove = None;
-                for tag in &current_tags {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(tag)
-                                .background_color(egui::Color32::from_rgb(60, 80, 120))
-                                .color(egui::Color32::from_rgb(200, 210, 230)),
-                        );
-                        if ui.small_button("×").clicked() {
-                            tag_to_remove = Some(tag.clone());
-                        }
-                    });
-                }
-                if let Some(tag) = tag_to_remove {
-                    if let Some(db) = &self.db {
-                        let _ = db.remove_tag(&pid, &tag);
-                    }
-                    if let Some(t) = self.tags.get_mut(&pid) {
-                        t.retain(|x| x != &tag);
-                    }
-                    self.all_tags = self
-                        .db
-                        .as_ref()
-                        .and_then(|d| d.get_all_tags().ok())
-                        .unwrap_or_default();
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.new_tag);
-                if ui.small_button("+ Tag").clicked() && !self.new_tag.trim().is_empty() {
-                    let tag = self.new_tag.trim().to_lowercase();
-                    if let Some(db) = &self.db {
-                        let _ = db.add_tag(&pid, &tag);
-                    }
-                    self.tags.entry(pid.clone()).or_default().push(tag.clone());
-                    if !self.all_tags.contains(&tag) {
-                        self.all_tags.push(tag);
-                        self.all_tags.sort();
-                    }
-                    self.new_tag.clear();
-                }
-            });
-        }
-
-        ui.separator();
-
-        ui.heading("Activity");
-        egui::Grid::new("activity_grid")
-            .num_columns(2)
-            .spacing([20.0, 4.0])
-            .show(ui, |ui| {
-                ui.label("Last Seen:");
-                ui.label(format_timestamp(project.last_seen));
-                ui.end_row();
-
-                if let Some(ts) = project.last_commit_ts {
-                    ui.label("Last Commit:");
-                    ui.label(format_timestamp(ts));
-                    ui.end_row();
-                }
-
-                if let Some(ts) = project.last_fs_activity_ts {
-                    ui.label("Last FS Activity:");
-                    ui.label(format_timestamp(ts));
-                    ui.end_row();
-                }
-
-                if let Some(branch) = &project.branch {
-                    ui.label("Branch:");
-                    ui.label(branch);
-                    ui.end_row();
-                }
-
-                ui.label("Dirty:");
-                if project.dirty {
-                    ui.label(egui::RichText::new("Yes ●").color(egui::Color32::from_rgb(255, 150, 50)));
-                } else {
-                    ui.label(egui::RichText::new("No ✓").color(egui::Color32::from_rgb(100, 200, 100)));
-                }
-                ui.end_row();
-            });
-
+        ui.add_space(4.0);
         ui.separator();
         ui.heading("Languages");
 
-        let project_id = &project.project_id;
-        if let Some(breakdown) = self.languages.get(project_id) {
+        if let Some(breakdown) = self.languages.get(&project.project_id) {
             let top_langs = breakdown.top_n(5);
             if top_langs.is_empty() {
                 ui.label("No code files detected");
@@ -600,119 +755,234 @@ impl ProjectShelfApp {
             ui.label("No language data");
         }
 
-        let project_id = project.project_id.clone();
-        let project_path = project.path.clone();
+        ui.add_space(6.0);
+        ui.menu_button("⬇ Export", |ui| {
+            if ui.button("Markdown (.md)").clicked() {
+                self.export_single(ExportFormat::Markdown, project);
+                ui.close_menu();
+            }
+            if ui.button("CSV (.csv)").clicked() {
+                self.export_single(ExportFormat::Csv, project);
+                ui.close_menu();
+            }
+        });
 
-        ui.separator();
-        self.render_milestones(ui, &project_id);
-
-        ui.separator();
-        self.render_notes(ui, &project_id, &project_path);
+        ui.add_space(8.0);
+        egui::CollapsingHeader::new("Tags")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.render_tags(ui, &project.project_id);
+            });
     }
 
-    fn render_milestones(&mut self, ui: &mut egui::Ui, project_id: &str) {
-        ui.horizontal(|ui| {
-            ui.heading("Milestones");
-            if ui.small_button("+ Add").clicked() && !self.new_milestone_title.trim().is_empty() {
-                let milestone = Milestone {
-                    project_id: project_id.to_string(),
-                    id: uuid_simple(),
-                    title: self.new_milestone_title.trim().to_string(),
-                    status: MilestoneStatus::Todo,
-                    due_ts: None,
-                    link: None,
-                };
-                if let Some(db) = &self.db {
-                    let _ = db.upsert_milestone(&milestone);
-                }
-                self.milestones
-                    .entry(project_id.to_string())
-                    .or_default()
-                    .push(milestone);
-                self.new_milestone_title.clear();
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("New:");
-            ui.text_edit_singleline(&mut self.new_milestone_title);
-        });
-
-        if !self.milestones.contains_key(project_id) {
+    /// Tags editor for a project. Tucked into a collapsed section at the bottom
+    /// of the details panel — low-priority for now.
+    fn render_tags(&mut self, ui: &mut egui::Ui, project_id: &str) {
+        let pid = project_id.to_string();
+        if !self.tags.contains_key(&pid) {
             if let Some(db) = &self.db {
-                if let Ok(ms) = db.get_milestones(project_id) {
-                    self.milestones.insert(project_id.to_string(), ms);
+                if let Ok(t) = db.get_tags(&pid) {
+                    self.tags.insert(pid.clone(), t);
                 }
             }
         }
 
-        let milestones = self.milestones.get(project_id).cloned().unwrap_or_default();
-        if milestones.is_empty() {
-            ui.label(egui::RichText::new("No milestones yet").color(egui::Color32::GRAY));
+        let current_tags: Vec<String> = self.tags.get(&pid).cloned().unwrap_or_default();
+
+        ui.horizontal_wrapped(|ui| {
+            let mut tag_to_remove = None;
+            for tag in &current_tags {
+                ui.label(
+                    egui::RichText::new(tag)
+                        .background_color(egui::Color32::from_rgb(60, 80, 120))
+                        .color(egui::Color32::from_rgb(200, 210, 230)),
+                );
+                if ui.small_button("×").clicked() {
+                    tag_to_remove = Some(tag.clone());
+                }
+            }
+            if let Some(tag) = tag_to_remove {
+                if let Some(db) = &self.db {
+                    let _ = db.remove_tag(&pid, &tag);
+                }
+                if let Some(t) = self.tags.get_mut(&pid) {
+                    t.retain(|x| x != &tag);
+                }
+                self.all_tags = self
+                    .db
+                    .as_ref()
+                    .and_then(|d| d.get_all_tags().ok())
+                    .unwrap_or_default();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.new_tag);
+            if ui.small_button("+ Tag").clicked() && !self.new_tag.trim().is_empty() {
+                let tag = self.new_tag.trim().to_lowercase();
+                if let Some(db) = &self.db {
+                    let _ = db.add_tag(&pid, &tag);
+                }
+                self.tags.entry(pid.clone()).or_default().push(tag.clone());
+                if !self.all_tags.contains(&tag) {
+                    self.all_tags.push(tag);
+                    self.all_tags.sort();
+                }
+                self.new_tag.clear();
+            }
+        });
+    }
+
+    /// Read-only view of the project's `ROADMAP.md` checklist. The file is the
+    /// source of truth; we never write back. Parsed result is cached per project
+    /// and invalidated on scan/watch. The item list is independently scrollable.
+    fn render_roadmap(&mut self, ui: &mut egui::Ui, project_id: &str, project_path: &str) {
+        let checklist = self
+            .task_cache
+            .entry(project_id.to_string())
+            .or_insert_with(|| parse_checklist(Path::new(project_path)));
+
+        let checklist = match checklist {
+            Some(c) => c,
+            None => {
+                ui.add_space(2.0);
+                ui.heading("Roadmap");
+                ui.label(
+                    egui::RichText::new("No ROADMAP.md found")
+                        .color(egui::Color32::from_rgb(130, 130, 130))
+                        .italics(),
+                );
+                return;
+            }
+        };
+
+        ui.horizontal(|ui| {
+            ui.heading("Roadmap");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(&checklist.source)
+                        .color(egui::Color32::from_rgb(120, 120, 120))
+                        .small(),
+                );
+            });
+        });
+
+        // Progress summary + bar.
+        let total = checklist.total();
+        let done = checklist.done();
+        let pct = if total > 0 {
+            (done as f32 / total as f32 * 100.0).round() as u32
         } else {
-            let mut to_delete: Option<String> = None;
-            let mut updates: Vec<Milestone> = Vec::new();
-
-            for m in &milestones {
-                ui.horizontal(|ui| {
-                    let status_emoji = match m.status {
-                        MilestoneStatus::Todo => "⬚",
-                        MilestoneStatus::InProgress => "▶",
-                        MilestoneStatus::Blocked => "⊘",
-                        MilestoneStatus::Done => "✓",
-                    };
-
-                    let mut current_status = m.status.clone();
-                    egui::ComboBox::from_id_source(&m.id)
-                        .selected_text(status_emoji)
-                        .width(40.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut current_status, MilestoneStatus::Todo, "⬚ Todo");
-                            ui.selectable_value(&mut current_status, MilestoneStatus::InProgress, "▶ In Progress");
-                            ui.selectable_value(&mut current_status, MilestoneStatus::Blocked, "⊘ Blocked");
-                            ui.selectable_value(&mut current_status, MilestoneStatus::Done, "✓ Done");
-                        });
-
-                    if current_status != m.status {
-                        let mut updated = m.clone();
-                        updated.status = current_status;
-                        updates.push(updated);
-                    }
-
-                    let text_color = match m.status {
-                        MilestoneStatus::Done => egui::Color32::from_rgb(100, 200, 100),
-                        MilestoneStatus::Blocked => egui::Color32::from_rgb(255, 100, 100),
-                        MilestoneStatus::InProgress => egui::Color32::from_rgb(100, 150, 255),
-                        MilestoneStatus::Todo => egui::Color32::GRAY,
-                    };
-                    ui.label(egui::RichText::new(&m.title).color(text_color));
-
-                    if ui.small_button("🗑").clicked() {
-                        to_delete = Some(m.id.clone());
-                    }
-                });
-            }
-
-            for updated in updates {
-                if let Some(db) = &self.db {
-                    let _ = db.upsert_milestone(&updated);
-                }
-                if let Some(list) = self.milestones.get_mut(project_id) {
-                    if let Some(m) = list.iter_mut().find(|x| x.id == updated.id) {
-                        m.status = updated.status;
-                    }
-                }
-            }
-
-            if let Some(id) = to_delete {
-                if let Some(db) = &self.db {
-                    let _ = db.delete_milestone(project_id, &id);
-                }
-                if let Some(list) = self.milestones.get_mut(project_id) {
-                    list.retain(|x| x.id != id);
-                }
-            }
+            0
+        };
+        ui.add_space(4.0);
+        let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+        let bar_w = ui.available_width().min(380.0);
+        let (rect, _r) = ui.allocate_exact_size(egui::vec2(bar_w, 10.0), egui::Sense::hover());
+        let rounding = egui::Rounding::same(5.0);
+        ui.painter()
+            .rect_filled(rect, rounding, egui::Color32::from_rgb(48, 50, 54));
+        if frac > 0.0 {
+            let filled =
+                egui::Rect::from_min_size(rect.min, egui::vec2(bar_w * frac, rect.height()));
+            ui.painter()
+                .rect_filled(filled, rounding, egui::Color32::from_rgb(96, 176, 112));
         }
+        ui.add_space(3.0);
+        ui.label(
+            egui::RichText::new(format!("{done} / {total} done · {pct}%"))
+                .color(egui::Color32::from_rgb(165, 165, 170))
+                .small(),
+        );
+        ui.add_space(6.0);
+
+        // Scrollable item list, filling the remaining height of the Roadmap tab.
+        egui::ScrollArea::vertical()
+            .id_source(("roadmap", project_id))
+            .max_height(ui.available_height().max(160.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                // Uncompleted items first, grouped by their section.
+                let mut any_open = false;
+                let mut first = true;
+                for (i, section) in checklist.sections.iter().enumerate() {
+                    if !section.items.iter().any(|it| !it.done) {
+                        continue;
+                    }
+                    any_open = true;
+                    if let Some(title) = &section.title {
+                        if !first {
+                            ui.add_space(8.0);
+                        }
+                        let (text, color) = if section.counted {
+                            (title.clone(), egui::Color32::from_rgb(214, 214, 220))
+                        } else {
+                            (
+                                format!("{title}  ·  backlog"),
+                                egui::Color32::from_rgb(135, 135, 140),
+                            )
+                        };
+                        ui.label(egui::RichText::new(text).strong().color(color));
+                        ui.add_space(3.0);
+                    }
+                    first = false;
+                    ui.indent(("todo", project_id, i), |ui| {
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        for item in section.items.iter().filter(|it| !it.done) {
+                            ui.label(
+                                egui::RichText::new(format!("○  {}", item.text))
+                                    .color(egui::Color32::from_rgb(205, 205, 212)),
+                            );
+                        }
+                    });
+                }
+                if !any_open {
+                    ui.label(
+                        egui::RichText::new("✓  All tasks complete")
+                            .color(egui::Color32::from_rgb(120, 190, 130)),
+                    );
+                }
+
+                // Completed items, split out below and collapsed by default.
+                let done_total = checklist
+                    .sections
+                    .iter()
+                    .flat_map(|s| &s.items)
+                    .filter(|it| it.done)
+                    .count();
+                if done_total > 0 {
+                    ui.add_space(10.0);
+                    egui::CollapsingHeader::new(format!("Completed ({done_total})"))
+                        .id_source(("completed", project_id))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for (i, section) in checklist.sections.iter().enumerate() {
+                                if !section.items.iter().any(|it| it.done) {
+                                    continue;
+                                }
+                                if let Some(title) = &section.title {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        egui::RichText::new(title)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(150, 150, 156)),
+                                    );
+                                    ui.add_space(2.0);
+                                }
+                                ui.indent(("done", project_id, i), |ui| {
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+                                    for item in section.items.iter().filter(|it| it.done) {
+                                        ui.label(
+                                            egui::RichText::new(format!("✓  {}", item.text))
+                                                .color(egui::Color32::from_rgb(120, 128, 122))
+                                                .strikethrough(),
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                }
+            });
     }
 
     fn render_notes(&mut self, ui: &mut egui::Ui, project_id: &str, project_path: &str) {
@@ -755,7 +1025,6 @@ impl ProjectShelfApp {
     }
 
     fn save_project_file(&self, project_id: &str, project_path: &str) {
-        let milestones = self.milestones.get(project_id).cloned().unwrap_or_default();
         let user_meta = self
             .user_meta
             .get(project_id)
@@ -766,7 +1035,10 @@ impl ProjectShelfApp {
                 notes: String::new(),
             });
 
-        let proj_file = ProjectFile::from_data(&milestones, &user_meta);
+        // Preserve any existing milestones in the YAML; only update notes/pinned.
+        let mut proj_file = ProjectFile::load(Path::new(project_path)).unwrap_or_default();
+        proj_file.notes = user_meta.notes;
+        proj_file.pinned = user_meta.pinned;
         let _ = proj_file.save(Path::new(project_path));
     }
 
@@ -815,6 +1087,7 @@ impl ProjectShelfApp {
 impl eframe::App for ProjectShelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_scan_results();
+        self.check_watch_results();
 
         if self.is_scanning {
             ctx.request_repaint();
@@ -832,7 +1105,11 @@ impl eframe::App for ProjectShelfApp {
             if self.show_settings {
                 self.render_settings(ui);
             } else {
-                self.render_project_details(ui);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        self.render_project_details(ui);
+                    });
             }
         });
     }
@@ -917,14 +1194,6 @@ fn language_color(lang: &str) -> egui::Color32 {
     }
 }
 
-fn uuid_simple() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{:x}{:x}", now.as_secs(), now.subsec_nanos())
-}
-
 fn icon_kind_color(kind: &str) -> egui::Color32 {
     match kind {
         "rust" => egui::Color32::from_rgb(222, 165, 132),
@@ -943,6 +1212,244 @@ fn colored_button(ui: &mut egui::Ui, text: &str, color: egui::Color32) -> egui::
         egui::RichText::new(text).color(egui::Color32::from_rgb(230, 230, 230))
     ).fill(color);
     ui.add(button)
+}
+
+#[derive(Clone, Copy)]
+enum ExportFormat {
+    Markdown,
+    Csv,
+}
+
+struct ExportRow {
+    name: String,
+    path: String,
+    language: String,
+    branch: String,
+    dirty: bool,
+    last_commit: String,
+    tags: String,
+    health: projectshelf_core::HealthChecks,
+}
+
+const EXPORT_HEADERS: [&str; 11] = [
+    "Name", "Path", "Language", "Branch", "Dirty", "Last Commit", "Tags", "README", "License",
+    "Tests", "CI",
+];
+
+fn export_cells(r: &ExportRow) -> [String; 11] {
+    let yn = |b: bool| if b { "yes" } else { "no" }.to_string();
+    [
+        r.name.clone(),
+        r.path.clone(),
+        r.language.clone(),
+        r.branch.clone(),
+        yn(r.dirty),
+        r.last_commit.clone(),
+        r.tags.clone(),
+        yn(r.health.has_readme),
+        yn(r.health.has_license),
+        yn(r.health.has_tests),
+        yn(r.health.has_ci),
+    ]
+}
+
+fn render_markdown(rows: &[ExportRow]) -> String {
+    let mut out = String::from("# ProjectShelf Report\n\n");
+    out.push_str(&format!("| {} |\n", EXPORT_HEADERS.join(" | ")));
+    out.push_str(&format!("|{}\n", " --- |".repeat(EXPORT_HEADERS.len())));
+    for r in rows {
+        let cells: Vec<String> = export_cells(r)
+            .iter()
+            .map(|c| c.replace('|', "\\|"))
+            .collect();
+        out.push_str(&format!("| {} |\n", cells.join(" | ")));
+    }
+    out
+}
+
+fn render_csv(rows: &[ExportRow]) -> String {
+    let mut out = String::new();
+    out.push_str(&EXPORT_HEADERS.join(","));
+    out.push('\n');
+    for r in rows {
+        let cells: Vec<String> = export_cells(r).iter().map(|c| csv_escape(c)).collect();
+        out.push_str(&cells.join(","));
+        out.push('\n');
+    }
+    out
+}
+
+fn csv_escape(field: &str) -> String {
+    if field.contains([',', '"', '\n']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Spawn the filesystem watcher thread. Returns a receiver over which batches
+/// of re-scanned (changed) projects arrive. The watcher debounces bursts and
+/// only re-scans the projects whose files actually changed.
+fn spawn_watcher(root: PathBuf, ctx: egui::Context) -> Receiver<Vec<(Project, LanguageBreakdown)>> {
+    let (update_tx, update_rx) = channel::<Vec<(Project, LanguageBreakdown)>>();
+
+    thread::spawn(move || {
+        let (event_tx, event_rx) = channel::<notify::Event>();
+        let mut watcher = match notify::recommended_watcher(
+            move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res {
+                    let _ = event_tx.send(event);
+                }
+            },
+        ) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        // Lightweight watching: only each project's root dir (non-recursive)
+        // and its `.git` dir, instead of recursively watching the whole tree.
+        // Recursive watching of ~/Projects would register one inotify watch per
+        // directory — ~100k of them, most inside node_modules/target/.git — which
+        // is a huge resource cost and a likely cause of crashes under FS bursts.
+        // Trade-off: edits deep inside a project (e.g. src/) won't auto-refresh;
+        // commits, dirty state, and project-root changes still do. Use Refresh
+        // for a full re-scan.
+        let mut watch_count = 0;
+        for d in discover_projects(&root) {
+            if watcher.watch(&d.path, RecursiveMode::NonRecursive).is_ok() {
+                watch_count += 1;
+            }
+            let git = d.path.join(".git");
+            if git.is_dir() && watcher.watch(&git, RecursiveMode::NonRecursive).is_ok() {
+                watch_count += 1;
+            }
+        }
+        if watch_count == 0 {
+            return;
+        }
+
+        loop {
+            // Block until something changes, then drain a quiet window so a
+            // burst of events (e.g. a git commit or save-all) collapses into
+            // one re-scan.
+            let first = match event_rx.recv() {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let mut changed: HashSet<PathBuf> = HashSet::new();
+            collect_changed_paths(&first, &mut changed);
+            while let Ok(e) = event_rx.recv_timeout(Duration::from_millis(600)) {
+                collect_changed_paths(&e, &mut changed);
+            }
+
+            let mut project_dirs: HashSet<PathBuf> = HashSet::new();
+            for p in &changed {
+                if let Some(dir) = find_project_root(p, &root) {
+                    project_dirs.insert(dir);
+                }
+            }
+            if project_dirs.is_empty() {
+                continue;
+            }
+
+            let results: Vec<_> = project_dirs.iter().map(|d| scan_single_project(d)).collect();
+            if update_tx.send(results).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+        }
+    });
+
+    update_rx
+}
+
+/// Record an event's paths, skipping build/vendor dirs but keeping `.git` so
+/// commit and dirty-state changes are still picked up.
+fn collect_changed_paths(event: &notify::Event, changed: &mut HashSet<PathBuf>) {
+    for path in &event.paths {
+        let in_ignored_dir = path.components().any(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            s != ".git" && IGNORED_DIRS.contains(&s.as_ref())
+        });
+        if !in_ignored_dir {
+            changed.insert(path.clone());
+        }
+    }
+}
+
+/// Reduce a project name to a safe filename stem (alphanumerics, `-`, `_`).
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let trimmed = cleaned.trim_matches('-');
+    if trimmed.is_empty() {
+        "unnamed".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Color for the list roadmap badge by completion: amber when there's lots to
+/// do, blue when almost done, green when complete.
+fn roadmap_badge_color(done: u32, total: u32) -> egui::Color32 {
+    let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+    if total > 0 && done >= total {
+        egui::Color32::from_rgb(120, 190, 130) // done
+    } else if frac >= 0.70 {
+        egui::Color32::from_rgb(110, 160, 240) // almost done
+    } else {
+        egui::Color32::from_rgb(225, 190, 90) // lots to do
+    }
+}
+
+/// Render a multi-line project tooltip with spaced-out lines (first line — the
+/// project name — emphasized).
+fn tooltip_body(ui: &mut egui::Ui, tip: &str) {
+    ui.spacing_mut().item_spacing.y = 5.0;
+    for (i, line) in tip.lines().enumerate() {
+        if i == 0 {
+            ui.label(egui::RichText::new(line).strong());
+        } else if let Some(rest) = line.strip_prefix("● ") {
+            // Dirty-state line: paint the marker (font may lack the ● glyph).
+            ui.horizontal(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                ui.painter().rect_filled(
+                    rect,
+                    egui::Rounding::same(2.0),
+                    egui::Color32::from_rgb(255, 150, 50),
+                );
+                ui.label(rest);
+            });
+        } else if let Some(rest) = line.strip_prefix("Roadmap: ") {
+            // Color the roadmap line by completion, matching the list badge.
+            let color = rest.split_once('/').and_then(|(d, t)| {
+                let d = d.trim().parse::<u32>().ok()?;
+                let t = t.trim().parse::<u32>().ok()?;
+                Some(roadmap_badge_color(d, t))
+            });
+            match color {
+                Some(c) => ui.label(egui::RichText::new(line).color(c)),
+                None => ui.label(line),
+            };
+        } else {
+            ui.label(line);
+        }
+    }
+}
+
+fn health_badge(ui: &mut egui::Ui, label: &str, present: bool) {
+    let (mark, color) = if present {
+        ("✓", egui::Color32::from_rgb(100, 200, 100))
+    } else {
+        ("✗", egui::Color32::from_rgb(150, 150, 150))
+    };
+    ui.label(
+        egui::RichText::new(format!("{mark} {label}"))
+            .color(color)
+            .background_color(egui::Color32::from_rgb(45, 45, 45)),
+    );
 }
 
 struct AppSettings {
@@ -989,6 +1496,28 @@ fn save_app_settings(settings: &AppSettings) {
         settings.projects_root, settings.preferred_ide
     );
     let _ = std::fs::write(path, content);
+}
+
+/// Global spacing / visual tweaks to give the UI more breathing room.
+fn configure_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.indent = 16.0;
+    style.spacing.interact_size.y = 24.0;
+    // Cleaner indents (no left guide-line on the roadmap item groups).
+    style.visuals.indent_has_left_vline = false;
+    // Lighter border on tooltips / popups / menus so it's easier to see.
+    style.visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(140));
+    // More breathing room inside tooltips / menus.
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    // Slightly rounder widgets.
+    let rounding = egui::Rounding::same(4.0);
+    style.visuals.widgets.noninteractive.rounding = rounding;
+    style.visuals.widgets.inactive.rounding = rounding;
+    style.visuals.widgets.hovered.rounding = rounding;
+    style.visuals.widgets.active.rounding = rounding;
+    ctx.set_style(style);
 }
 
 fn configure_fonts(ctx: &egui::Context) {

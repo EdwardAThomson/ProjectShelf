@@ -1,6 +1,8 @@
 use crate::config::{data_dir, db_path};
 use crate::languages::LanguageBreakdown;
-use crate::models::{IconKind, Milestone, MilestoneStatus, Project, UserMeta};
+use crate::models::{
+    HealthChecks, IconKind, Milestone, MilestoneStatus, Project, TaskProgress, UserMeta,
+};
 use rusqlite::{params, Connection, Result};
 use std::fs;
 use thiserror::Error;
@@ -42,7 +44,14 @@ impl Database {
                 dirty INTEGER NOT NULL DEFAULT 0,
                 branch TEXT,
                 primary_language TEXT,
-                github_url TEXT
+                github_url TEXT,
+                has_readme INTEGER NOT NULL DEFAULT 0,
+                has_license INTEGER NOT NULL DEFAULT 0,
+                has_tests INTEGER NOT NULL DEFAULT 0,
+                has_ci INTEGER NOT NULL DEFAULT 0,
+                task_total INTEGER NOT NULL DEFAULT 0,
+                task_done INTEGER NOT NULL DEFAULT 0,
+                task_source TEXT
             );
 
             CREATE TABLE IF NOT EXISTS languages (
@@ -94,6 +103,25 @@ impl Database {
             [],
         );
 
+        // Migration: add health-check columns if missing
+        for col in ["has_readme", "has_license", "has_tests", "has_ci"] {
+            let _ = self.conn.execute(
+                &format!("ALTER TABLE projects ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            );
+        }
+
+        // Migration: add task-progress columns if missing
+        for col in ["task_total", "task_done"] {
+            let _ = self.conn.execute(
+                &format!("ALTER TABLE projects ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            );
+        }
+        let _ = self
+            .conn
+            .execute("ALTER TABLE projects ADD COLUMN task_source TEXT", []);
+
         Ok(())
     }
 
@@ -102,8 +130,10 @@ impl Database {
             r#"
             INSERT INTO projects (
                 project_id, name, path, icon_kind, last_seen,
-                last_commit_ts, last_fs_activity_ts, dirty, branch, primary_language, github_url
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                last_commit_ts, last_fs_activity_ts, dirty, branch, primary_language, github_url,
+                has_readme, has_license, has_tests, has_ci,
+                task_total, task_done, task_source
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(project_id) DO UPDATE SET
                 name = excluded.name,
                 path = excluded.path,
@@ -114,7 +144,14 @@ impl Database {
                 dirty = excluded.dirty,
                 branch = excluded.branch,
                 primary_language = excluded.primary_language,
-                github_url = excluded.github_url
+                github_url = excluded.github_url,
+                has_readme = excluded.has_readme,
+                has_license = excluded.has_license,
+                has_tests = excluded.has_tests,
+                has_ci = excluded.has_ci,
+                task_total = excluded.task_total,
+                task_done = excluded.task_done,
+                task_source = excluded.task_source
             "#,
             params![
                 project.project_id,
@@ -128,6 +165,13 @@ impl Database {
                 project.branch,
                 project.primary_language,
                 project.github_url,
+                project.health.has_readme as i32,
+                project.health.has_license as i32,
+                project.health.has_tests as i32,
+                project.health.has_ci as i32,
+                project.tasks.total,
+                project.tasks.done,
+                project.tasks.source,
             ],
         )?;
         Ok(())
@@ -137,7 +181,9 @@ impl Database {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT project_id, name, path, icon_kind, last_seen,
-                   last_commit_ts, last_fs_activity_ts, dirty, branch, primary_language, github_url
+                   last_commit_ts, last_fs_activity_ts, dirty, branch, primary_language, github_url,
+                   has_readme, has_license, has_tests, has_ci,
+                   task_total, task_done, task_source
             FROM projects
             ORDER BY last_seen DESC
             "#,
@@ -157,6 +203,17 @@ impl Database {
                     branch: row.get(8)?,
                     primary_language: row.get(9)?,
                     github_url: row.get(10)?,
+                    health: HealthChecks {
+                        has_readme: row.get::<_, i32>(11)? != 0,
+                        has_license: row.get::<_, i32>(12)? != 0,
+                        has_tests: row.get::<_, i32>(13)? != 0,
+                        has_ci: row.get::<_, i32>(14)? != 0,
+                    },
+                    tasks: TaskProgress {
+                        total: row.get::<_, i64>(15)? as u32,
+                        done: row.get::<_, i64>(16)? as u32,
+                        source: row.get(17)?,
+                    },
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

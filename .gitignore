@@ -35,3 +35,6 @@ Desktop.ini
 # SQLite (only if you decide to store a local dev DB inside the repo)
 *.sqlite
 *.sqlite3
+
+# Misc
+how_to_run.txt

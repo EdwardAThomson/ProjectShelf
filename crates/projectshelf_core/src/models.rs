@@ -13,6 +13,28 @@ pub struct Project {
     pub branch: Option<String>,
     pub primary_language: Option<String>,
     pub github_url: Option<String>,
+    pub health: HealthChecks,
+    pub tasks: TaskProgress,
+}
+
+/// Presence flags for common project hygiene files, computed on scan.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct HealthChecks {
+    pub has_readme: bool,
+    pub has_license: bool,
+    pub has_tests: bool,
+    pub has_ci: bool,
+}
+
+/// Cached progress of a markdown task list (`- [ ]` / `- [x]`) found in a
+/// project's tracking file. The full item list is re-read from disk on demand;
+/// these counts exist so the list can show progress instantly from cache.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskProgress {
+    pub total: u32,
+    pub done: u32,
+    /// Filename the tasks were read from, e.g. `TODO.md`. `None` if no list.
+    pub source: Option<String>,
 }
 
 impl Project {

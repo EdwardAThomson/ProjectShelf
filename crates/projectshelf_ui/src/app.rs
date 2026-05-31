@@ -611,7 +611,7 @@ impl ProjectShelfApp {
             }
             ui.add_space(8.0);
             ui.label(
-                egui::RichText::new(&project.path)
+                egui::RichText::new(abbreviate_home(&project.path))
                     .color(egui::Color32::GRAY)
                     .small(),
             );
@@ -1204,6 +1204,21 @@ fn format_timestamp(ts: i64) -> String {
     }
 
     "unknown".to_string()
+}
+
+/// Replace the home-directory prefix of a path with `~` for display.
+fn abbreviate_home(path: &str) -> String {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => h.to_string_lossy().into_owned(),
+        None => return path.to_string(),
+    };
+    if path == home {
+        return "~".to_string();
+    }
+    match path.strip_prefix(&format!("{home}/")) {
+        Some(rest) => format!("~/{rest}"),
+        None => path.to_string(),
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {

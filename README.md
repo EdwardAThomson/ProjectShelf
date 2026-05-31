@@ -21,7 +21,7 @@ A local-first desktop application that indexes projects inside `~/Projects` and 
 
 ## Screenshots
 
-*Coming soon*
+![ProjectShelf](Screenshot_20260531.png)
 
 ## Requirements
 

@@ -40,7 +40,12 @@ fn discover_recursive(dir: &Path, depth: usize, projects: &mut Vec<DiscoveredPro
             is_git: has_git,
             has_marker,
         });
-        return;
+        // Deliberately do NOT return here. Keep descending so nested *independent*
+        // repos are also discovered — i.e. a "meta-repo" workspace that is itself a
+        // git repo (tracking shared/docs) but contains its own sub-repos in
+        // subdirectories. `IGNORED_DIRS` (skips `.git`, `node_modules`, `vendor`,
+        // `target`, …) and `MAX_DEPTH` bound the extra walking; a normal project's
+        // own source tree contains no markers, so nothing spurious is added.
     }
 
     let entries = match fs::read_dir(dir) {
@@ -222,4 +227,74 @@ pub fn scan_single_project(dir: &Path) -> (Project, LanguageBreakdown) {
         has_marker: dir.join(".projman").join("project.yaml").exists(),
     };
     build_project(&discovered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn mk_dir(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+    }
+
+    /// Create a directory that looks like a git repo (just the `.git` dir).
+    fn mk_repo(dir: &Path) {
+        fs::create_dir_all(dir.join(".git")).unwrap();
+    }
+
+    /// A meta-repo (itself a git repo) that contains its own independent
+    /// sub-repos must surface both the meta-repo and every nested repo, while
+    /// leaving plain source dirs and ignored dirs alone.
+    #[test]
+    fn discovers_nested_independent_repos() {
+        let root = std::env::temp_dir().join("projectshelf_discover_test_nested");
+        let _ = fs::remove_dir_all(&root);
+        mk_dir(&root);
+
+        // Meta-repo workspace: a repo that holds sub-repos in subdirectories.
+        mk_repo(&root.join("meta"));
+        mk_repo(&root.join("meta").join("inner")); // nested repo (direct child)
+        mk_repo(&root.join("meta").join("client").join("demo")); // repo under a non-repo subdir
+        mk_dir(&root.join("meta").join("src")); // plain source dir — not a project
+        mk_repo(&root.join("meta").join("node_modules")); // ignored dir — must NOT surface
+
+        // A normal standalone repo with a source subdir.
+        mk_repo(&root.join("normal"));
+        mk_dir(&root.join("normal").join("src"));
+
+        let found: HashSet<String> = discover_projects(&root)
+            .iter()
+            .map(|p| {
+                p.path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        assert!(found.contains("meta"), "meta-repo itself should be discovered");
+        assert!(found.contains("normal"), "standalone repo should be discovered");
+        assert!(found.contains("meta/inner"), "nested repo should be discovered");
+        assert!(
+            found.contains("meta/client/demo"),
+            "repo nested under a non-repo subdir should be discovered"
+        );
+        assert!(
+            !found.iter().any(|p| p.contains("node_modules")),
+            "repos inside IGNORED_DIRS must not surface"
+        );
+        assert!(
+            !found.contains("meta/src") && !found.contains("normal/src"),
+            "plain source dirs are not projects"
+        );
+        assert_eq!(
+            found.len(),
+            4,
+            "exactly: meta, meta/inner, meta/client/demo, normal — got {found:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

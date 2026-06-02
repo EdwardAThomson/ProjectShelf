@@ -25,6 +25,17 @@ impl Database {
         fs::create_dir_all(&data)?;
 
         let conn = Connection::open(db_path())?;
+        // WAL + synchronous=NORMAL: writes go to a write-ahead log and only
+        // fsync at checkpoints instead of on every commit. SQLite's default
+        // (DELETE journal + synchronous=FULL) fsyncs per commit, so a scan's
+        // many small upserts become an fsync storm that stalls on the ext4
+        // journal and freezes the UI when the disk is busy. WAL also lets reads
+        // proceed during writes. busy_timeout avoids SQLITE_BUSY when a
+        // checkpoint overlaps a write. (NORMAL can lose the last transaction on
+        // an OS/power crash, never corrupt the db — fine for a rebuildable cache.)
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )?;
         let db = Database { conn };
         db.init_schema()?;
         Ok(db)

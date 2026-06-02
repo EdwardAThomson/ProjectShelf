@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct ProjectShelfApp {
     projects: Vec<Project>,
@@ -40,6 +40,16 @@ pub struct ProjectShelfApp {
     list_version: u64,
     list_cache: Vec<ListRow>,
     list_key: Option<(u64, String, SortMode, Option<String>)>,
+    /// When the user last interacted. While recent, we paint at the display's
+    /// refresh rate so interactions land in a single frame; otherwise we idle.
+    last_interaction: Option<Instant>,
+    /// Background roadmap pre-warm results (project_id → parsed checklist),
+    /// merged into `task_cache` so the first Roadmap view of any project is
+    /// instant rather than parsing `ROADMAP.md` on the UI thread.
+    prewarm_rx: Option<Receiver<Vec<(String, Option<Checklist>)>>>,
+    /// Previous window-focus state, so we can force a repaint on focus-gain and
+    /// not leave a stale frame after the window was occluded while idle.
+    was_focused: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,6 +134,9 @@ impl ProjectShelfApp {
             list_version: 0,
             list_cache: Vec::new(),
             list_key: None,
+            last_interaction: None,
+            prewarm_rx: None,
+            was_focused: false,
         };
 
         app.start_scan();
@@ -213,7 +226,44 @@ impl ProjectShelfApp {
                 self.list_version = self.list_version.wrapping_add(1);
                 self.is_scanning = false;
                 self.scan_rx = None;
+                self.start_roadmap_prewarm();
             }
+        }
+    }
+
+    /// Parse every project's roadmap on a background thread and stash the results
+    /// for `check_prewarm_results` to merge into `task_cache`. Keeps the first
+    /// Roadmap view instant without doing disk I/O on the UI thread.
+    fn start_roadmap_prewarm(&mut self) {
+        let targets: Vec<(String, String)> = self
+            .projects
+            .iter()
+            .map(|p| (p.project_id.clone(), p.path.clone()))
+            .collect();
+        let (tx, rx) = channel();
+        self.prewarm_rx = Some(rx);
+        thread::spawn(move || {
+            let parsed: Vec<(String, Option<Checklist>)> = targets
+                .into_iter()
+                .map(|(id, path)| (id, parse_checklist(Path::new(&path))))
+                .collect();
+            let _ = tx.send(parsed);
+        });
+    }
+
+    /// Merge pre-warmed roadmaps into `task_cache` without clobbering entries a
+    /// click or watch update already filled.
+    fn check_prewarm_results(&mut self) {
+        let parsed = match &self.prewarm_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(p) => p,
+                Err(_) => return,
+            },
+            None => return,
+        };
+        self.prewarm_rx = None;
+        for (id, checklist) in parsed {
+            self.task_cache.entry(id).or_insert(checklist);
         }
     }
 
@@ -1145,8 +1195,33 @@ impl eframe::App for ProjectShelfApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.check_scan_results();
         self.check_watch_results();
+        self.check_prewarm_results();
 
         if self.is_scanning {
+            ctx.request_repaint();
+        }
+        // Poll for the background roadmap pre-warm without spinning a core.
+        if self.prewarm_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+
+        // Snappy interaction without burning CPU at idle. egui is reactive
+        // (paints on input), so a click can cost an extra frame or two: waking
+        // from idle, plus multi-pass layout settling on the *next* repaint.
+        // After any input, keep painting at the display's refresh rate for a
+        // short trailing window so the result lands in a single frame; once the
+        // window lapses with no input, egui returns to idle (zero CPU).
+        // Regaining window focus (e.g. after being occluded while idle) forces a
+        // fresh paint so a stale frame can't linger.
+        let focused = ctx.input(|i| i.focused);
+        if (focused && !self.was_focused) || ctx.input(|i| !i.events.is_empty()) {
+            self.last_interaction = Some(Instant::now());
+        }
+        self.was_focused = focused;
+        if self
+            .last_interaction
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+        {
             ctx.request_repaint();
         }
 

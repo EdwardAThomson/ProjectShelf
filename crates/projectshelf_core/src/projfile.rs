@@ -8,6 +8,8 @@ pub struct ProjectFile {
     #[serde(default)]
     pub notes: String,
     #[serde(default)]
+    pub description: String,
+    #[serde(default)]
     pub milestones: Vec<ProjectFileMilestone>,
     #[serde(default)]
     pub pinned: bool,
@@ -67,12 +69,14 @@ impl ProjectFile {
             project_id: project_id.to_string(),
             pinned: self.pinned,
             notes: self.notes.clone(),
+            description: self.description.clone(),
         }
     }
 
     pub fn from_data(milestones: &[Milestone], user_meta: &UserMeta) -> Self {
         ProjectFile {
             notes: user_meta.notes.clone(),
+            description: user_meta.description.clone(),
             pinned: user_meta.pinned,
             milestones: milestones
                 .iter()

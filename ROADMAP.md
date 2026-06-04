@@ -1,8 +1,8 @@
 # Roadmap — ProjectShelf
 
-_Status: active · updated 2026-05-31_
+_Status: active · updated 2026-06-03_
 
-See [`docs/roadmap-format.md`](docs/roadmap-format.md) for the canonical roadmap convention this file follows.
+A local-first Linux desktop app (Rust + egui) that scans your projects directory for git repos and marked projects and presents them as a fast, searchable shelf — git metadata, language breakdowns, roadmap progress, health checks, notes, and tags, all cached in SQLite for instant startup.
 
 ## Shipped (M1–M10)
 

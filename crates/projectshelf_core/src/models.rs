@@ -148,4 +148,7 @@ pub struct UserMeta {
     pub project_id: String,
     pub pinned: bool,
     pub notes: String,
+    /// User-authored project description. Only used as a fallback when the
+    /// project's `ROADMAP.md` has no preamble to derive one from.
+    pub description: String,
 }

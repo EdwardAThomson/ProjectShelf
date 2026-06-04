@@ -77,6 +77,7 @@ impl Database {
                 project_id TEXT PRIMARY KEY,
                 pinned INTEGER NOT NULL DEFAULT 0,
                 notes TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (project_id) REFERENCES projects(project_id) ON DELETE CASCADE
             );
 
@@ -132,6 +133,12 @@ impl Database {
         let _ = self
             .conn
             .execute("ALTER TABLE projects ADD COLUMN task_source TEXT", []);
+
+        // Migration: add the user-authored description column if missing.
+        let _ = self.conn.execute(
+            "ALTER TABLE user_meta ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+            [],
+        );
 
         Ok(())
     }
@@ -280,20 +287,21 @@ impl Database {
     pub fn upsert_user_meta(&self, meta: &UserMeta) -> Result<(), DbError> {
         self.conn.execute(
             r#"
-            INSERT INTO user_meta (project_id, pinned, notes)
-            VALUES (?1, ?2, ?3)
+            INSERT INTO user_meta (project_id, pinned, notes, description)
+            VALUES (?1, ?2, ?3, ?4)
             ON CONFLICT(project_id) DO UPDATE SET
                 pinned = excluded.pinned,
-                notes = excluded.notes
+                notes = excluded.notes,
+                description = excluded.description
             "#,
-            params![meta.project_id, meta.pinned as i32, meta.notes],
+            params![meta.project_id, meta.pinned as i32, meta.notes, meta.description],
         )?;
         Ok(())
     }
 
     pub fn get_user_meta(&self, project_id: &str) -> Result<UserMeta, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT project_id, pinned, notes FROM user_meta WHERE project_id = ?1",
+            "SELECT project_id, pinned, notes, description FROM user_meta WHERE project_id = ?1",
         )?;
 
         let result = stmt.query_row(params![project_id], |row| {
@@ -301,6 +309,7 @@ impl Database {
                 project_id: row.get(0)?,
                 pinned: row.get::<_, i32>(1)? != 0,
                 notes: row.get(2)?,
+                description: row.get(3)?,
             })
         });
 
@@ -308,8 +317,7 @@ impl Database {
             Ok(meta) => Ok(meta),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(UserMeta {
                 project_id: project_id.to_string(),
-                pinned: false,
-                notes: String::new(),
+                ..Default::default()
             }),
             Err(e) => Err(DbError::Sqlite(e)),
         }

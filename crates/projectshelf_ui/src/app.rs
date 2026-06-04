@@ -191,15 +191,13 @@ impl ProjectShelfApp {
                         let _ = db.upsert_languages(&project.project_id, &lang_breakdown);
                     }
 
-                    // Import notes from YAML on scan (DB is otherwise the source
-                    // of truth — only fill in when the DB has no notes yet).
+                    // Import notes/description from YAML on scan (DB is otherwise
+                    // the source of truth — only fill in fields the DB lacks).
                     if let Some(pf) = ProjectFile::load(Path::new(&project.path)) {
                         let yaml_meta = pf.to_user_meta(&project.project_id);
                         if let Some(db) = &self.db {
-                            if let Ok(existing) = db.get_user_meta(&project.project_id) {
-                                if existing.notes.is_empty() && !yaml_meta.notes.is_empty() {
-                                    let _ = db.upsert_user_meta(&yaml_meta);
-                                }
+                            if let Some(merged) = merge_yaml_meta(db, &yaml_meta) {
+                                let _ = db.upsert_user_meta(&merged);
                             }
                         }
                     }
@@ -284,13 +282,11 @@ impl ProjectShelfApp {
                     let _ = db.upsert_project(&project);
                     let _ = db.upsert_languages(&project.project_id, &breakdown);
 
-                    // Import notes from YAML, mirroring check_scan_results.
+                    // Import notes/description from YAML, mirroring check_scan_results.
                     if let Some(pf) = ProjectFile::load(Path::new(&project.path)) {
                         let yaml_meta = pf.to_user_meta(&project.project_id);
-                        if let Ok(existing) = db.get_user_meta(&project.project_id) {
-                            if existing.notes.is_empty() && !yaml_meta.notes.is_empty() {
-                                let _ = db.upsert_user_meta(&yaml_meta);
-                            }
+                        if let Some(merged) = merge_yaml_meta(db, &yaml_meta) {
+                            let _ = db.upsert_user_meta(&merged);
                         }
                     }
                 }
@@ -677,8 +673,7 @@ impl ProjectShelfApp {
         if toggle_pin {
             let meta = self.user_meta.entry(pid.clone()).or_insert_with(|| UserMeta {
                 project_id: pid.clone(),
-                pinned: false,
-                notes: String::new(),
+                ..Default::default()
             });
             meta.pinned = !meta.pinned;
             if let Some(db) = &self.db {
@@ -762,6 +757,64 @@ impl ProjectShelfApp {
     /// "Overview" tab: activity + health side by side, languages, export, and a
     /// collapsed tags editor.
     fn render_overview(&mut self, ui: &mut egui::Ui, project: &Project) {
+        // Description: prefer the ROADMAP.md preamble; fall back to a
+        // user-editable box for projects whose roadmap has no preamble.
+        let roadmap_desc: Option<(String, String)> = self
+            .task_cache
+            .entry(project.project_id.clone())
+            .or_insert_with(|| parse_checklist(Path::new(&project.path)))
+            .as_ref()
+            .and_then(|c| c.description.clone().map(|d| (d, c.source.clone())));
+
+        ui.add_space(2.0);
+        ui.heading("Description");
+        ui.add_space(6.0);
+        match roadmap_desc {
+            Some((desc, source)) => {
+                ui.label(
+                    egui::RichText::new(desc)
+                        .color(egui::Color32::from_rgb(205, 205, 212)),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!("from {source}"))
+                        .small()
+                        .italics()
+                        .color(egui::Color32::from_rgb(120, 120, 125)),
+                );
+            }
+            None => {
+                if !self.user_meta.contains_key(&project.project_id) {
+                    if let Some(db) = &self.db {
+                        if let Ok(meta) = db.get_user_meta(&project.project_id) {
+                            self.user_meta.insert(project.project_id.clone(), meta);
+                        }
+                    }
+                }
+                let meta = self
+                    .user_meta
+                    .entry(project.project_id.clone())
+                    .or_insert_with(|| UserMeta {
+                        project_id: project.project_id.clone(),
+                        ..Default::default()
+                    });
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut meta.description)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2)
+                        .hint_text("Add a short description (no ROADMAP.md preamble found)…"),
+                );
+                if resp.changed() {
+                    if let Some(db) = &self.db {
+                        let _ = db.upsert_user_meta(meta);
+                    }
+                }
+            }
+        }
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
         // Activity (left) and Health (right), side by side.
         ui.columns(2, |cols| {
             cols[0].heading("Activity");
@@ -1009,38 +1062,83 @@ impl ProjectShelfApp {
             .max_height(ui.available_height().max(160.0))
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                // Uncompleted items first, grouped by their section.
-                let mut any_open = false;
+                // Open items first, grouped by section. Sections are flat but
+                // carry a heading `level`; a deeper section is a sub-phase of
+                // the nearest shallower one. Show every section with open items
+                // plus its ancestor headers (for context), indented by depth so
+                // the hierarchy reads clearly.
+                let secs = &checklist.sections;
+                let parent: Vec<Option<usize>> = (0..secs.len())
+                    .map(|i| (0..i).rev().find(|&j| secs[j].level < secs[i].level))
+                    .collect();
+                let mut show = vec![false; secs.len()];
+                for i in 0..secs.len() {
+                    if secs[i].items.iter().any(|it| !it.done) {
+                        show[i] = true;
+                        let mut p = parent[i];
+                        while let Some(pi) = p {
+                            show[pi] = true;
+                            p = parent[pi];
+                        }
+                    }
+                }
+                let any_open = show.iter().any(|&s| s);
+
                 let mut first = true;
-                for (i, section) in checklist.sections.iter().enumerate() {
-                    if !section.items.iter().any(|it| !it.done) {
+                for (i, section) in secs.iter().enumerate() {
+                    if !show[i] {
                         continue;
                     }
-                    any_open = true;
-                    if let Some(title) = &section.title {
-                        if !first {
-                            ui.add_space(8.0);
-                        }
-                        let (text, color) = if section.counted {
-                            (title.clone(), egui::Color32::from_rgb(214, 214, 220))
-                        } else {
-                            (
-                                format!("{title}  ·  backlog"),
-                                egui::Color32::from_rgb(135, 135, 140),
-                            )
-                        };
-                        ui.label(egui::RichText::new(text).strong().color(color));
-                        ui.add_space(3.0);
+                    if !first {
+                        ui.add_space(8.0);
                     }
                     first = false;
-                    ui.indent(("todo", project_id, i), |ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
-                        for item in section.items.iter().filter(|it| !it.done) {
-                            ui.label(
-                                egui::RichText::new(format!("○  {}", item.text))
-                                    .color(egui::Color32::from_rgb(205, 205, 212)),
-                            );
+                    let depth = section.level.saturating_sub(2);
+                    let has_open = section.items.iter().any(|it| !it.done);
+                    ui.horizontal(|ui| {
+                        if depth > 0 {
+                            ui.add_space(16.0 * depth as f32);
                         }
+                        ui.vertical(|ui| {
+                            if let Some(title) = &section.title {
+                                let (text, color) = if section.counted {
+                                    (title.clone(), egui::Color32::from_rgb(214, 214, 220))
+                                } else {
+                                    (
+                                        format!("{title}  ·  backlog"),
+                                        egui::Color32::from_rgb(135, 135, 140),
+                                    )
+                                };
+                                ui.label(egui::RichText::new(text).strong().color(color));
+                                if let Some(desc) = &section.description {
+                                    ui.label(
+                                        egui::RichText::new(desc)
+                                            .small()
+                                            .italics()
+                                            .color(egui::Color32::from_rgb(140, 140, 146)),
+                                    );
+                                }
+                            }
+                            if has_open {
+                                ui.add_space(3.0);
+                                ui.indent(("todo", project_id, i), |ui| {
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+                                    for item in section.items.iter().filter(|it| !it.done) {
+                                        ui.label(
+                                            egui::RichText::new(format!("○  {}", item.text))
+                                                .color(egui::Color32::from_rgb(205, 205, 212)),
+                                        );
+                                        if let Some(detail) = &item.detail {
+                                            ui.label(
+                                                egui::RichText::new(format!("     {detail}"))
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(140, 140, 146)),
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        });
                     });
                 }
                 if !any_open {
@@ -1067,24 +1165,40 @@ impl ProjectShelfApp {
                                 if !section.items.iter().any(|it| it.done) {
                                     continue;
                                 }
-                                if let Some(title) = &section.title {
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        egui::RichText::new(title)
-                                            .strong()
-                                            .color(egui::Color32::from_rgb(150, 150, 156)),
-                                    );
-                                    ui.add_space(2.0);
-                                }
-                                ui.indent(("done", project_id, i), |ui| {
-                                    ui.spacing_mut().item_spacing.y = 4.0;
-                                    for item in section.items.iter().filter(|it| it.done) {
-                                        ui.label(
-                                            egui::RichText::new(format!("✓  {}", item.text))
-                                                .color(egui::Color32::from_rgb(120, 128, 122))
-                                                .strikethrough(),
-                                        );
+                                let depth = section.level.saturating_sub(2);
+                                ui.horizontal(|ui| {
+                                    if depth > 0 {
+                                        ui.add_space(16.0 * depth as f32);
                                     }
+                                    ui.vertical(|ui| {
+                                        if let Some(title) = &section.title {
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                egui::RichText::new(title)
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(150, 150, 156)),
+                                            );
+                                            if let Some(desc) = &section.description {
+                                                ui.label(
+                                                    egui::RichText::new(desc)
+                                                        .small()
+                                                        .italics()
+                                                        .color(egui::Color32::from_rgb(120, 120, 126)),
+                                                );
+                                            }
+                                            ui.add_space(2.0);
+                                        }
+                                        ui.indent(("done", project_id, i), |ui| {
+                                            ui.spacing_mut().item_spacing.y = 4.0;
+                                            for item in section.items.iter().filter(|it| it.done) {
+                                                ui.label(
+                                                    egui::RichText::new(format!("✓  {}", item.text))
+                                                        .color(egui::Color32::from_rgb(120, 128, 122))
+                                                        .strikethrough(),
+                                                );
+                                            }
+                                        });
+                                    });
                                 });
                             }
                         });
@@ -1113,8 +1227,7 @@ impl ProjectShelfApp {
             .entry(project_id.to_string())
             .or_insert_with(|| UserMeta {
                 project_id: project_id.to_string(),
-                pinned: false,
-                notes: String::new(),
+                ..Default::default()
             });
 
         let response = ui.add(
@@ -1138,13 +1251,13 @@ impl ProjectShelfApp {
             .cloned()
             .unwrap_or_else(|| UserMeta {
                 project_id: project_id.to_string(),
-                pinned: false,
-                notes: String::new(),
+                ..Default::default()
             });
 
-        // Preserve any existing milestones in the YAML; only update notes/pinned.
+        // Preserve any existing milestones in the YAML; update notes/description/pinned.
         let mut proj_file = ProjectFile::load(Path::new(project_path)).unwrap_or_default();
         proj_file.notes = user_meta.notes;
+        proj_file.description = user_meta.description;
         proj_file.pinned = user_meta.pinned;
         let _ = proj_file.save(Path::new(project_path));
     }
@@ -1245,6 +1358,24 @@ impl eframe::App for ProjectShelfApp {
             }
         });
     }
+}
+
+/// Fill any DB `user_meta` fields the YAML can supply but the DB is missing
+/// (notes, description). Returns the merged meta to upsert, or `None` if the DB
+/// already has everything (so no write is needed). The DB stays the source of
+/// truth — YAML only seeds empty fields.
+fn merge_yaml_meta(db: &Database, yaml_meta: &UserMeta) -> Option<UserMeta> {
+    let mut existing = db.get_user_meta(&yaml_meta.project_id).ok()?;
+    let mut changed = false;
+    if existing.notes.is_empty() && !yaml_meta.notes.is_empty() {
+        existing.notes = yaml_meta.notes.clone();
+        changed = true;
+    }
+    if existing.description.is_empty() && !yaml_meta.description.is_empty() {
+        existing.description = yaml_meta.description.clone();
+        changed = true;
+    }
+    changed.then_some(existing)
 }
 
 fn format_timestamp(ts: i64) -> String {

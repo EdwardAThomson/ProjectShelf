@@ -1,6 +1,6 @@
 # Roadmap — ProjectShelf
 
-_Status: active · updated 2026-06-03_
+_Status: active · updated 2026-07-14_
 
 A local-first Linux desktop app (Rust + egui) that scans your projects directory for git repos and marked projects and presents them as a fast, searchable shelf — git metadata, language breakdowns, roadmap progress, health checks, notes, and tags, all cached in SQLite for instant startup.
 
@@ -37,3 +37,11 @@ A local-first Linux desktop app (Rust + egui) that scans your projects directory
 - [ ] Per-section progress in the Roadmap tab (sections are grouped + split done/open; per-section done/total counts still TODO)
 - [ ] Optional per-project roadmap-source override in `.projman/project.yaml`
 - [ ] Galley/virtualized rendering for very large roadmaps (only if big lists prove laggy in practice)
+
+### Automation-center integration (idea)
+
+Surface reports from `automation-center` (the local automations command-center: blog-radar ideas, nightly-sweep dev-log/docs-sweep, open PRs, publish queue) inside ProjectShelf, so the shelf shows not just a project's git/roadmap state but its automation activity too.
+
+- [ ] Per-project "Automation" panel/tab: show that project's automation-center activity (e.g. blog-radar ideas sourced from it, recent sweep PRs, open PRs) next to its git + roadmap info
+- [ ] Global automation report: combine ProjectShelf's project list with automation-center's status output (timers, open PRs, publish queue) into one dashboard/export
+- [ ] Decide the integration seam: read automation-center's JSON/state directly (e.g. `~/blog-ideas/ideas.json`) vs shelling out to `automation-center --status` / `automation-status`
